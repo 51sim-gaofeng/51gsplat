@@ -125,6 +125,8 @@ def get_build_parameters():
             "-Xcompiler",
             "/Zc:preprocessor",
             "-DWIN32_LEAN_AND_MEAN",
+            "-Xcompiler",
+            "/bigobj",
         ]
     else:
         extra_cflags = ["-std=c++20"]
@@ -157,6 +159,8 @@ def get_build_parameters():
     extra_cuda_cflags += ["-use_fast_math"] if FAST_MATH else []
 
     extra_cuda_cflags += ["-diag-suppress", "20012,186"]
+    if os.name == "nt":
+        extra_cuda_cflags += ["-D_CUDA_PTX_CLUSTERLAUNCHCONTROL_H_"]
     if not os.name == "nt":
         extra_cflags += ["-Wno-attributes"]
         extra_cflags += ["-Wno-unknown-pragmas"]

@@ -18,7 +18,16 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <vector_types.h>
 #include <cstdint>
+
+// Windows (MSVC) does not provide the POSIX 'uint' type alias.
+#ifdef _WIN32
+#ifndef _UINT_DEFINED
+#define _UINT_DEFINED
+typedef unsigned int uint;
+#endif
+#endif
 
 // Type-punning helper: reinterpret the bits of v as type T and assign to u.
 template<typename T, typename U, typename V>

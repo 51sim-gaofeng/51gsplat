@@ -136,6 +136,12 @@ def get_build_parameters():
             "-Xcompiler",
             "/Zc:preprocessor",
             "-DWIN32_LEAN_AND_MEAN",
+            # /bigobj: required for CUDA files with large numbers of template
+            # instantiations (e.g. ParallelBatchFwd with 23 channel counts x many
+            # kernel configs). Without this MSVC silently truncates the COFF object
+            # file at 65535 sections, dropping the host-side dispatch function symbol.
+            "-Xcompiler",
+            "/bigobj",
         ]
     else:
         extra_cflags = ["-std=c++20"]
@@ -180,6 +186,12 @@ def get_build_parameters():
     #       torch::python::module member is valid code, but nvcc emits
     #       a noisy compatibility diagnostic when parsing it as an identifier.
     extra_cuda_cflags += ["-diag-suppress", "3189,20012,186"]
+    if os.name == "nt":
+        # CUDA 12.9 introduced clusterlaunchcontrol.h which uses 'long2' inline
+        # assembly with constraint 'l' (64-bit), but on MSVC/Windows 'long' is
+        # 32-bit, causing "asm operand type size" errors. Pre-define the include
+        # guard to skip this header entirely (gsplat does not use CLC features).
+        extra_cuda_cflags += ["-D_CUDA_PTX_CLUSTERLAUNCHCONTROL_H_"]
     if not os.name == "nt":
         extra_cflags += ["-Wno-attributes"]
         # PyTorch headers trip this under GCC when gsplat's debug build enables -Werror.

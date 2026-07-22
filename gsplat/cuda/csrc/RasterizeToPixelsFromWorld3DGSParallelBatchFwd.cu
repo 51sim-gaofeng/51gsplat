@@ -1527,7 +1527,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_fwd_kernel(
     const at::Tensor batch_offsets,    // [num_tiles + 1] int32
     const at::Tensor bid_to_slot,      // [total_batches] int32
     const int64_t total_batches,       // scalar; equals batch_offsets[num_tiles]
-    const bool fwd_only,
+    bool fwd_only, // MSVC name-mangling fix: no const on top-level value param
     // outputs
     at::Tensor renders,                     // [..., C, image_height, image_width, channels]
     at::Tensor alphas,                      // [..., C, image_height, image_width]
@@ -1816,6 +1816,13 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_fwd_kernel(
         // compiles out batch-scan's masked-tile safe-store.
         auto launch_batch_scan     = [&]<bool SAFE_MASKED_OUTPUTS>()
         {
+            // MSVC C3495 workaround: redeclare constexpr vars from outer lambda
+            constexpr uint32_t CDIM = ChannelsT::value;
+            constexpr bool ReturnNormals = static_cast<bool>(ReturnNormalsT::value);
+            constexpr bool UseHitDistance = static_cast<bool>(UseHitDistanceT::value);
+            constexpr uint32_t TILE_SIZE = TileSizeT::value;
+            constexpr uint32_t CTA_SIZE = CtaSizeForTile<TILE_SIZE>::value;
+            constexpr bool ForBackward = FwdOnlyT::value == 0;
             rasterize_to_pixels_from_world_3dgs_fwd_batch_scan_kernel<
                 CDIM,
                 TILE_SIZE,
