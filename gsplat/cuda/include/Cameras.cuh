@@ -22,10 +22,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <limits>
 #include <type_traits>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 // Silence warnings / errors of the form
 //
@@ -779,7 +781,9 @@ struct OrthographicCameraModel
         }
 
         const auto point = glm::fvec2{ray.x, ray.y} / ray.z;
-        if(!std::isfinite(point.x) || !std::isfinite(point.y))
+        // Avoid std::isfinite in device code on Windows NVCC/MSVC.
+        // NaN makes both comparisons false; +/-Inf fails the FLT_MAX bounds.
+        if(!(point.x <= FLT_MAX && point.x >= -FLT_MAX && point.y <= FLT_MAX && point.y >= -FLT_MAX))
         {
             return {
                 glm::fvec2{0.f, 0.f},

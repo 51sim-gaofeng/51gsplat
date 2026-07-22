@@ -17,6 +17,9 @@
  */
 
 #include "Config.h"
+#ifdef _MSC_VER
+#include <intrin.h>  // for _BitScanReverse64
+#endif
 
 #if GSPLAT_BUILD_3DGUT
 
@@ -186,7 +189,13 @@ namespace
         {
             return 0;
         }
+#ifdef _MSC_VER
+        unsigned long _bsr_idx;
+        _BitScanReverse64(&_bsr_idx, x - 1);
+        return static_cast<uint32_t>(_bsr_idx) + 1u;
+#else
         return 64u - static_cast<uint32_t>(__builtin_clzll(x - 1));
+#endif
     }
 } // namespace
 
@@ -230,6 +239,15 @@ at::Tensor compute_bid_to_slot(
     // Sort by `(batch_round, tile)` while carrying the original tile-major
     // slot as the value. The sorted values are the launch-index to slot
     // permutation; no extra scatter is needed.
+#ifdef _MSC_VER
+    // Windows: at::cuda::cub::radix_sort_pairs links against
+    // radix_sort_pairs_impl<int64_t, 4> which is not exported from
+    // torch_cuda.lib on Windows. Use torch's sort + gather instead.
+    {
+        auto sort_result = at::sort(sort_keys, /*dim=*/0, /*descending=*/false);
+        bid_to_slot.copy_(sort_values.index_select(0, std::get<1>(sort_result)));
+    }
+#else
     at::cuda::cub::radix_sort_pairs<int64_t, int32_t>(
         sort_keys.const_data_ptr<int64_t>(),
         sorted_keys.data_ptr<int64_t>(),
@@ -240,6 +258,7 @@ at::Tensor compute_bid_to_slot(
         /*begin_bit=*/0,
         /*end_bit=*/static_cast<int64_t>(total_bits == 0 ? 1u : total_bits)
     );
+#endif
 
     return bid_to_slot;
 }
