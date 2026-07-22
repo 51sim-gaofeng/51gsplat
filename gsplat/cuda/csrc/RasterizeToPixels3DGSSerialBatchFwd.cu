@@ -342,6 +342,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
 
         auto launch_variant = [&]<uint32_t TILE_SIZE, uint32_t CTA_SIZE>()
         {
+            constexpr uint32_t CDIM = ChannelsT::value; // MSVC C3495 workaround
             const dim3 threads       = dim3{CTA_SIZE, 1, 1};
             const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
 
@@ -460,6 +461,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernels(
 
         auto launch_variant = [&]<uint32_t TILE_SIZE, uint32_t CTA_SIZE>()
         {
+            constexpr uint32_t CDIM = ChannelsT::value; // MSVC C3495 workaround
             const dim3 threads       = dim3{CTA_SIZE, 1, 1};
             const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
 
