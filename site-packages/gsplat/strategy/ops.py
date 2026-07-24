@@ -1,0 +1,511 @@
+# SPDX-FileCopyrightText: Copyright 2023-2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+import numpy as np
+from typing import TYPE_CHECKING, Callable, Dict, List, Union
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+from gsplat import quat_scale_to_covar_preci
+from gsplat.relocation import compute_relocation
+from gsplat.utils import normalized_quat_to_rotmat
+
+if TYPE_CHECKING:
+    from gsplat.scene import Scene
+
+_MCMC_BACKEND_TORCH = {"torch", "pytorch", "py"}
+_MCMC_BACKEND_CUDA = {"cuda", "native", ""}
+DEFAULT_MCMC_OPACITY_T = 0.005
+DEFAULT_MCMC_OPACITY_K = 100.0
+_raw = os.environ.get("GSPLAT_MCMC_BACKEND", "").strip().lower()
+_force_torch_backend = _raw in _MCMC_BACKEND_TORCH
+if _raw and _raw not in _MCMC_BACKEND_TORCH | _MCMC_BACKEND_CUDA:
+    import warnings
+
+    warnings.warn(
+        f"GSPLAT_MCMC_BACKEND={_raw!r} not recognised; using default (CUDA with"
+        f" fallback). Valid: {sorted(_MCMC_BACKEND_TORCH | _MCMC_BACKEND_CUDA)}",
+        stacklevel=2,
+    )
+
+
+def _resolve_noise_scale(noise_scale: float | None, scaler: float | None) -> float:
+    if noise_scale is None:
+        if scaler is None:
+            raise TypeError("noise_scale must be provided")
+        return float(scaler)
+    if scaler is not None and float(noise_scale) != float(scaler):
+        raise ValueError(
+            "noise_scale and scaler aliases were both provided with different values"
+        )
+    return float(noise_scale)
+
+
+@torch.no_grad()
+def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Tensor:
+    """Sample from a distribution using torch.multinomial or numpy.random.choice.
+
+    This function adaptively chooses between `torch.multinomial` and `numpy.random.choice`
+    based on the number of elements in `weights`. If the number of elements exceeds
+    the torch.multinomial limit (2^24), it falls back to using `numpy.random.choice`.
+
+    Args:
+        weights (Tensor): A 1D tensor of weights for each element.
+        n (int): The number of samples to draw.
+        replacement (bool): Whether to sample with replacement. Default is True.
+
+    Returns:
+        Tensor: A 1D tensor of sampled indices.
+    """
+    num_elements = weights.size(0)
+
+    if num_elements <= 2**24:
+        # Use torch.multinomial for elements within the limit
+        return torch.multinomial(weights, n, replacement=replacement)
+    else:
+        # Fallback to numpy.random.choice for larger element spaces
+        weights = weights / weights.sum()
+        weights_np = weights.detach().cpu().numpy()
+        sampled_idxs_np = np.random.choice(
+            num_elements, size=n, p=weights_np, replace=replacement
+        )
+        sampled_idxs = torch.from_numpy(sampled_idxs_np)
+
+        # Return the sampled indices on the original device
+        return sampled_idxs.to(weights.device)
+
+
+@torch.no_grad()
+def _update_param_with_optimizer(
+    param_fn: Callable[[str, Tensor], Tensor],
+    optimizer_fn: Callable[[str, Tensor], Tensor],
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    names: Union[List[str], None] = None,
+):
+    """Update the parameters and the state in the optimizers with defined functions.
+
+    Args:
+        param_fn: A function that takes the name of the parameter and the parameter itself,
+            and returns the new parameter.
+        optimizer_fn: A function that takes the key of the optimizer state and the state value,
+            and returns the new state value.
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        names: A list of key names to update. If None, update all. Default: None.
+    """
+    if names is None:
+        # If names is not provided, update all parameters
+        names = list(params.keys())
+
+    for name in names:
+        param = params[name]
+        new_param = param_fn(name, param)
+        params[name] = new_param
+        if name not in optimizers:
+            assert not param.requires_grad, (
+                f"Optimizer for {name} is not found, but the parameter is trainable."
+                f"Got requires_grad={param.requires_grad}"
+            )
+            continue
+        optimizer = optimizers[name]
+        for i in range(len(optimizer.param_groups)):
+            param_state = optimizer.state[param]
+            del optimizer.state[param]
+            for key in param_state.keys():
+                if key != "step":
+                    v = param_state[key]
+                    param_state[key] = optimizer_fn(key, v)
+            optimizer.param_groups[i]["params"] = [new_param]
+            optimizer.state[new_param] = param_state
+
+
+@torch.no_grad()
+def duplicate(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    scene: Scene | None = None,
+):
+    """Inplace duplicate the Gaussian with the given mask.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to duplicate the Gaussians.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        return torch.nn.Parameter(torch.cat([p, p[sel]]), requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = torch.cat((v, v[sel]))
+    if scene is not None:
+        scene.on_duplicate(sel)
+
+
+@torch.no_grad()
+def split(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    revised_opacity: bool = False,
+    scene: Scene | None = None,
+):
+    """Inplace split the Gaussian with the given mask.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to split the Gaussians.
+        revised_opacity: Whether to use revised opacity formulation
+          from arXiv:2404.06109. Default: False.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    rest = torch.where(~mask)[0]
+
+    scales = torch.exp(params["scales"][sel])
+    quats = F.normalize(params["quats"][sel], dim=-1)
+    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    samples = torch.einsum(
+        "nij,nj,bnj->bni",
+        rotmats,
+        scales,
+        torch.randn(2, len(scales), 3, device=device),
+    )  # [2, N, 3]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        repeats = [2] + [1] * (p.dim() - 1)
+        if name == "means":
+            p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
+        elif name == "scales":
+            p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+        elif name == "opacities" and revised_opacity:
+            new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
+            p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
+        else:
+            p_split = p[sel].repeat(repeats)
+        p_new = torch.cat([p[rest], p_split])
+        p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+        return p_new
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
+        return torch.cat([v[rest], v_split])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            repeats = [2] + [1] * (v.dim() - 1)
+            v_new = v[sel].repeat(repeats)
+            state[k] = torch.cat((v[rest], v_new))
+    if scene is not None:
+        scene.on_split(sel, rest)
+
+
+@torch.no_grad()
+def remove(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    scene: Scene | None = None,
+):
+    """Inplace remove the Gaussian with the given mask.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to remove the Gaussians.
+    """
+    sel = torch.where(~mask)[0]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        return torch.nn.Parameter(p[sel], requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return v[sel]
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = v[sel]
+    if scene is not None:
+        scene.on_remove(mask)
+
+
+@torch.no_grad()
+def reset_opa(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    value: float,
+):
+    """Inplace reset the opacities to the given post-sigmoid value.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        value: The value to reset the opacities
+    """
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "opacities":
+            opacities = torch.clamp(p, max=torch.logit(torch.tensor(value)).item())
+            return torch.nn.Parameter(opacities, requires_grad=p.requires_grad)
+        else:
+            raise ValueError(f"Unexpected parameter name: {name}")
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.zeros_like(v)
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(
+        param_fn, optimizer_fn, params, optimizers, names=["opacities"]
+    )
+
+
+@torch.no_grad()
+def relocate(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    binoms: Tensor,
+    min_opacity: float = 0.005,
+    scene: Scene | None = None,
+):
+    """Inplace relocate some dead Gaussians to the lives ones.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to indicates which Gaussians are dead.
+    """
+    # support "opacities" with shape [N,] or [N, 1]
+    opacities = torch.sigmoid(params["opacities"])
+
+    dead_indices = mask.nonzero(as_tuple=True)[0]
+    alive_indices = (~mask).nonzero(as_tuple=True)[0]
+    n = len(dead_indices)
+
+    # Sample for new GSs
+    probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
+    sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    sampled_idxs = alive_indices[sampled_idxs]
+    new_opacities, new_scales = compute_relocation(
+        opacities=opacities[sampled_idxs],
+        scales=torch.exp(params["scales"])[sampled_idxs],
+        ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+        binoms=binoms,
+        min_opacity=min_opacity,
+    )
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "opacities":
+            p[sampled_idxs] = torch.logit(new_opacities)
+        elif name == "scales":
+            p[sampled_idxs] = torch.log(new_scales)
+        p[dead_indices] = p[sampled_idxs]
+        return torch.nn.Parameter(p, requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v[sampled_idxs] = 0
+        return v
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            v[sampled_idxs] = 0
+    if scene is not None:
+        scene.on_relocate(dead_indices, sampled_idxs)
+
+
+@torch.no_grad()
+def sample_add(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    n: int,
+    binoms: Tensor,
+    min_opacity: float = 0.005,
+    scene: Scene | None = None,
+):
+    opacities = torch.sigmoid(params["opacities"])
+
+    probs = opacities.flatten()
+    sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    new_opacities, new_scales = compute_relocation(
+        opacities=opacities[sampled_idxs],
+        scales=torch.exp(params["scales"])[sampled_idxs],
+        ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+        binoms=binoms,
+        min_opacity=min_opacity,
+    )
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "opacities":
+            p[sampled_idxs] = torch.logit(new_opacities)
+        elif name == "scales":
+            p[sampled_idxs] = torch.log(new_scales)
+        p_new = torch.cat([p, p[sampled_idxs]])
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+        return torch.cat([v, v_new])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+        if isinstance(v, torch.Tensor):
+            state[k] = torch.cat((v, v_new))
+    if scene is not None:
+        scene.on_sample_add(sampled_idxs)
+
+
+@torch.no_grad()
+def _cuda_fused_mcmc_perturb(
+    positions: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+    opacities: Tensor,
+    noise_scale: float | None = None,
+    *,
+    scaler: float | None = None,
+    t: float = DEFAULT_MCMC_OPACITY_T,
+    k: float = DEFAULT_MCMC_OPACITY_K,
+) -> bool:
+    """Try the fused CUDA kernel for MCMC perturbation; return False if not applicable.
+
+    positions must be contiguous (mutated in-place); other tensors are made contiguous
+    via .contiguous() since the kernel only reads them. See
+    gsplat/cuda/csrc/MCMCPerturbCUDA.cu for the kernel.
+    """
+    try:
+        from gsplat.cuda._backend import _C
+    except ImportError:
+        _C = None  # type: ignore[assignment]
+    if _C is None or not positions.is_cuda:
+        return False
+    # positions is modified in-place — cannot .contiguous()-copy;
+    # fall back to PyTorch if non-contiguous.
+    if not positions.is_contiguous():
+        return False
+    # All inputs must be float32 CUDA tensors
+    for tensor in (positions, quats, scales, opacities):
+        if tensor.dtype != torch.float32 or not tensor.is_cuda:
+            return False
+    try:
+        resolved_noise_scale = _resolve_noise_scale(noise_scale, scaler)
+        noise = torch.randn_like(positions)
+        torch.ops.gsplat.mcmc_perturb_positions(
+            positions,
+            quats.contiguous(),
+            scales.contiguous(),
+            opacities.flatten().contiguous(),
+            noise,
+            resolved_noise_scale,
+            float(t),
+            float(k),
+        )
+        return True
+    except AttributeError:
+        return False
+    except RuntimeError as e:
+        import warnings
+
+        warnings.warn(
+            f"CUDA fused MCMC perturb failed, falling back to PyTorch: {e}",
+            stacklevel=2,
+        )
+        return False
+
+
+@torch.no_grad()
+def inject_noise_to_position(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    noise_scale: float | None = None,
+    *,
+    scaler: float | None = None,
+    t: float = DEFAULT_MCMC_OPACITY_T,
+    k: float = DEFAULT_MCMC_OPACITY_K,
+):
+    """Add covariance- and opacity-weighted Gaussian noise to ``params["means"]`` in-place.
+
+    Prefers a fused CUDA kernel when available, with a pure-PyTorch fallback. The
+    backend can be overridden with the ``GSPLAT_MCMC_BACKEND`` env var:
+      * ``cuda`` / ``native`` / unset (default) — prefer the fused CUDA kernel.
+      * ``torch`` / ``pytorch`` / ``py`` — force the PyTorch fallback.
+    """
+    resolved_noise_scale = _resolve_noise_scale(noise_scale, scaler)
+    if not _force_torch_backend:
+        # Priority 1: native CUDA (single kernel launch)
+        if _cuda_fused_mcmc_perturb(
+            positions=params["means"],
+            quats=params["quats"],
+            scales=params["scales"],
+            opacities=params["opacities"],
+            noise_scale=resolved_noise_scale,
+            t=t,
+            k=k,
+        ):
+            return
+
+    # Priority 2: PyTorch fallback
+    opacities = torch.sigmoid(params["opacities"].flatten())
+    scales = torch.exp(params["scales"])
+    covars, _ = quat_scale_to_covar_preci(
+        params["quats"],
+        scales,
+        compute_covar=True,
+        compute_preci=False,
+        triu=False,
+    )
+
+    noise = (
+        torch.randn_like(params["means"])
+        * torch.sigmoid(-float(k) * (opacities - float(t))).unsqueeze(-1)
+        * resolved_noise_scale
+    )
+    noise = torch.einsum("bij,bj->bi", covars, noise)
+    params["means"].add_(noise)
