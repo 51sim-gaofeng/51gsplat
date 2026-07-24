@@ -67,13 +67,15 @@ def _repo_root() -> Path:
     return SCENE_ROOT.parent.parent
 
 
-def test_root_setup_ships_scene_cuda_sources():
-    """The scene CUDA/JIT sources ship with the main ``gsplat`` package.
+def test_root_setup_ships_and_builds_scene_cuda_extension():
+    """The root package ships scene CUDA sources and builds the native extension.
 
     Packaging is driven by the root ``setup.py``
-    (``package_data["gsplat.scene"]``) and ``MANIFEST.in``. This test asserts
-    (a) the CUDA sources physically exist where the package expects them and
-    (b) the root packaging metadata references them — without building a wheel.
+    (``package_data["gsplat.scene"]``, ``ext_modules``) and ``MANIFEST.in``.
+    This test asserts (a) the CUDA sources physically exist where the package
+    expects them, (b) the root packaging metadata references them, and (c) the
+    root setup registers ``gsplat_scene_cuda`` as a regular extension instead of
+    relying solely on runtime JIT.
     """
     repo_root = _repo_root()
     scene_cuda = repo_root / "gsplat" / "scene" / "kernels" / "cuda"
@@ -95,6 +97,11 @@ def test_root_setup_ships_scene_cuda_sources():
         '"gsplat.scene"' in setup_text
     ), "setup.py is missing gsplat.scene package_data"
     assert "kernels/cuda/csrc/*" in setup_text, "setup.py is missing scene csrc glob"
+    assert (
+        'os.path.join("gsplat", "scene", "kernels", "cuda", "build.py")' in setup_text
+    ), "setup.py is missing the scene CUDA build module"
+    assert 'scene_ext = CUDAExtension(' in setup_text, "setup.py is missing scene_ext"
+    assert 'scene_params.name' in setup_text, "setup.py is not building gsplat_scene_cuda"
     assert (
         "gsplat/scene/kernels/cuda" in manifest_text
     ), "MANIFEST.in is missing scene CUDA sources"

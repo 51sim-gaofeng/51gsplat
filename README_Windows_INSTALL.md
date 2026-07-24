@@ -8,8 +8,8 @@
 2. 安装VisualStudio 2022
 
 ## 安装方式
-1. 在build_gsplat.bat中修改Line14，修改改为本地的对应虚拟环境中的python路径，以及当前gsplat所处的路径
+1. 在build_gsplat.bat中修改Line15，改为本地的对应虚拟环境中的python路径，以及当前gsplat工程所处的路径
 2. 检查build_gsplat.bat所有执行命令路径正确后，在终端执行build_gsplat.bat
-3. 等待半个多小时编译安装完毕
+3. 等待一小时左右编译安装完毕
 
 
