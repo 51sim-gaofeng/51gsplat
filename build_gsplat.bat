@@ -11,7 +11,8 @@ where nvcc || goto :err
 where ninja || goto :err
 
 echo Building and installing gsplat from source into test env...
-C:\Users\qinlei\AppData\Local\anaconda3\envs\test\python.exe -m pip install -e G:\ws\Libs\51-gsplat --no-build-isolation -v
+@REM C:\Users\qinlei\AppData\Local\anaconda3\envs\test\python.exe -m pip install -e G:\ws\Libs\51-gsplat --no-build-isolation -v
+C:\Users\qinlei\AppData\Local\anaconda3\envs\test\python.exe -m pip install G:\ws\Libs\51-gsplat --no-build-isolation
 if errorlevel 1 goto :err
 
 echo Build completed.

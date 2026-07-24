@@ -67,7 +67,13 @@ def get_build_parameters() -> SimpleNamespace:
         extra_ldflags += [
             os.path.join(jit.TORCH_LIB_PATH, f"{lib}.lib") for lib in torch_cuda_libs
         ]
-    else:
+        # The scene extension has only .cpp sources compiled by cl.exe (not nvcc),
+        # so the CUDA runtime symbols pulled in by c10_cuda/torch_cuda must be
+        # linked explicitly on Windows.
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH", "")
+        if cuda_home:
+            extra_ldflags += [os.path.join(cuda_home, "lib", "x64", "cudart.lib")]
+    else:  # Linux / macOS
         extra_ldflags += [
             os.path.join(jit.TORCH_LIB_PATH, f"lib{lib}.so") for lib in torch_cuda_libs
         ]
