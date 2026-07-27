@@ -234,8 +234,22 @@ def get_extensions():
         extra_link_args=params.extra_ldflags,
     )
 
+    scene_build = _load_build_module(
+        "gsplat_scene_cuda_build",
+        os.path.join("gsplat", "scene", "kernels", "cuda", "build.py"),
+    )
+    scene_params = scene_build.get_build_parameters()
+    scene_sources = [os.path.relpath(s, setup_dir) for s in scene_params.sources]
+    scene_ext = CUDAExtension(
+        scene_params.name,
+        sources=scene_sources,
+        include_dirs=scene_params.extra_include_paths,
+        extra_compile_args={"cxx": scene_params.extra_cflags},
+        extra_link_args=scene_params.extra_ldflags,
+    )
+
     if not BUILD_EXPERIMENTAL:
-        return [gsplat_ext]
+        return [gsplat_ext, scene_ext]
 
     # --- experimental Inference render extension ---
     inference_build = _load_build_module(
@@ -259,7 +273,7 @@ def get_extensions():
         extra_link_args=inference_params.extra_ldflags,
     )
 
-    return [gsplat_ext, inference_ext]
+    return [gsplat_ext, scene_ext, inference_ext]
 
 
 def _setup():
