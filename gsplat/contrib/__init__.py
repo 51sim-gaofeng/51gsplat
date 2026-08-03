@@ -24,4 +24,6 @@ Contents:
 
 - :mod:`gsplat.contrib.dynamic` — deformable / 4D Gaussian Splatting
   (HexPlane field, MLP deformation network, :class:`DynamicStrategy`).
+- :mod:`gsplat.contrib.lod` — simple octree-based Level-of-Detail for
+  already-trained Gaussian scenes (inference-time only; no retraining).
 """
