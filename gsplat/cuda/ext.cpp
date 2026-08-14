@@ -37,6 +37,7 @@ void register_adam_cuda_impl(torch::Library &m);
 void register_external_distortion_wrappers_cuda_impl(torch::Library &m);
 void register_gaussian_losses_cuda_impl(torch::Library &m);
 void register_intersect_cuda_impl(torch::Library &m);
+void register_lod_select_cuda_impl(torch::Library &m);
 void register_intersect_privateuseone_impl(torch::Library &m);
 void register_mcmc_perturb_cuda_impl(torch::Library &m);
 void register_projection_cuda_impl(torch::Library &m);
@@ -1240,6 +1241,12 @@ TORCH_LIBRARY(gsplat, m)
         "float noise_scale, float t=0.005, float k=100.0) -> ()"
     );
 #endif
+    m.def("lod_build_binary_children(Tensor parents) -> Tensor");
+    m.def(
+        "lod_select_topdown(Tensor centers, Tensor sizes, Tensor radii, Tensor children, Tensor is_leaf, "
+        "Tensor cam_pos, Tensor w2c, Tensor K, int image_width, int image_height, float near_plane, "
+        "float error_threshold_px, int max_depth) -> (Tensor, Tensor)"
+    );
 
 #if GSPLAT_BUILD_CAMERA_WRAPPERS
     m.def(
@@ -1271,6 +1278,7 @@ TORCH_LIBRARY_IMPL(gsplat, CUDA, m)
 #endif
 
     gsplat::register_intersect_cuda_impl(m);
+    gsplat::register_lod_select_cuda_impl(m);
     gsplat::register_spherical_harmonics_cuda_impl(m);
     gsplat::register_projection_cuda_impl(m);
     gsplat::register_rasterization_cuda_impl(m);
