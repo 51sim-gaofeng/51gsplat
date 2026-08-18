@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 #include "Common.h" // CHECK_INPUT, DEVICE_GUARD, CameraModelType
@@ -69,9 +70,7 @@ namespace gaussian_render_inference_scene
             return state;
         }
 
-        auto opts_f = at::TensorOptions().dtype(at::kFloat).device(scene.means_planar.device());
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
-        auto opts_i = at::TensorOptions().dtype(at::kInt).device(scene.means_planar.device());
 
         // ---- Determine K from shape ----
         if(scene.sh_degree >= 0 && scene.colors_packed.dim() == 3)
@@ -111,14 +110,6 @@ namespace gaussian_render_inference_scene
             torch::cuda::synchronize();
         }
 
-        // ---- Pre-allocate per-frame intermediates ----
-        int64_t num_gaussians = static_cast<int64_t>(state->num_gaussians);
-        state->visible        = at::zeros({(num_gaussians + 31) / 32}, opts_i);
-        state->means2d        = at::empty({1, 1, num_gaussians, 2}, opts_f);
-        state->depths         = at::empty({1, 1, num_gaussians}, opts_f);
-        state->conics         = at::empty({1, 1, num_gaussians, 4}, opts_h);
-        state->colors         = at::zeros({num_gaussians, 4}, opts_h);
-
         // ---- Pre-allocate default black background: [R, G, B, T] ----
         state->background = at::zeros({1, 4}, opts_h);
         state->background.select(1, 3).fill_(at::Half(1.0f));
@@ -127,6 +118,40 @@ namespace gaussian_render_inference_scene
         state->isect = std::make_unique<IntersectMTFused>();
 
         return state;
+    }
+
+    static void ensure_render_capacity(
+        InferenceRenderState &state,
+        int64_t requested,
+        const at::Device &device
+    )
+    {
+        if(requested <= static_cast<int64_t>(state.buffer_capacity))
+        {
+            return;
+        }
+
+        uint64_t capacity = 1;
+        while(capacity < static_cast<uint64_t>(requested))
+        {
+            capacity <<= 1;
+        }
+        capacity = std::min<uint64_t>(capacity, state.num_gaussians);
+        TORCH_CHECK(
+            capacity <= std::numeric_limits<uint32_t>::max(),
+            "render buffer capacity exceeds uint32 range"
+        );
+
+        auto opts_f = at::TensorOptions().dtype(at::kFloat).device(device);
+        auto opts_h = at::TensorOptions().dtype(at::kHalf).device(device);
+        auto opts_i = at::TensorOptions().dtype(at::kInt).device(device);
+        const int64_t count = static_cast<int64_t>(capacity);
+        state.visible       = at::zeros({(count + 31) / 32}, opts_i);
+        state.means2d       = at::empty({1, 1, count, 2}, opts_f);
+        state.depths        = at::empty({1, 1, count}, opts_f);
+        state.conics        = at::empty({1, 1, count, 4}, opts_h);
+        state.colors        = at::empty({count, 4}, opts_h);
+        state.buffer_capacity = static_cast<uint32_t>(capacity);
     }
 
     // ==========================================================================
@@ -230,6 +255,11 @@ namespace gaussian_render_inference_scene
             }
             return rgbt;
         }
+        ensure_render_capacity(
+            state,
+            active_count,
+            scene.means_planar.device()
+        );
 
         // ---- Tile grid dimensions ----
         uint32_t tw

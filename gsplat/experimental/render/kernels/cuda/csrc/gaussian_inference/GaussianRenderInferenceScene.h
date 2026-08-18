@@ -60,13 +60,14 @@ namespace gaussian_render_inference_scene
         uint32_t num_gaussians         = 0; // total number of gaussians in the scene
         uint32_t maxShDegree           = 0; // maximum SH degree from scene data
         uint32_t sh_coeffs_per_channel = 0; // number of SH coefficients per color channel (K)
+        uint32_t buffer_capacity       = 0; // allocated compact render slots
 
         // SH compression product selected at creation time for K==16.
         int64_t shCompressionMode = 0;
         at::Tensor shCompressed;
         std::unique_ptr<higs::SHDecodeParams> shDecodeParams;
 
-        // Per-frame intermediates (persistent, sized once at creation)
+        // Per-frame intermediates (persistent, grown to active-set capacity)
         at::Tensor colors;  // [N, 4] half
         at::Tensor visible; // [(N+31)/32] int32
         at::Tensor means2d; // [1, 1, N, 2] float
