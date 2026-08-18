@@ -156,13 +156,19 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        const at::optional<at::Tensor> &active_indices
     )
     {
         // NOTE: No c10::NoGradGuard here -- the Python caller already enforces
         // torch.inference_mode() (via check_inference_grad_mode), so adding a
         // redundant guard would cost ~2 us per frame in thread-local toggles.
         DEVICE_GUARD(scene.means_planar);
+        TORCH_CHECK(
+            !active_indices.has_value(),
+            "active_indices API is available, but indexed inference kernels "
+            "have not been enabled yet"
+        );
 
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
 
@@ -474,7 +480,8 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        const at::optional<at::Tensor> &active_indices
     )
     {
         // Use the colors tensor normalized once at construction time (colors_normalized_)
@@ -502,7 +509,8 @@ namespace gaussian_render_inference_scene
             sh_degree,
             sh_compression_mode,
             background,
-            out_rgbt
+            out_rgbt,
+            active_indices
         );
     }
 
@@ -660,6 +668,7 @@ namespace gaussian_render_inference_scene
             sh_degree,
             sh_compression_mode,
             background,
+            at::nullopt,
             at::nullopt
         );
 

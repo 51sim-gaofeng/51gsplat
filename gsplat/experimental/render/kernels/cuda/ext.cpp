@@ -48,7 +48,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("sh_degree"),
             py::arg("sh_compression_mode"),
             py::arg("background"),
-            py::arg("out_rgbt")
+            py::arg("out_rgbt"),
+            py::arg("active_indices") = py::none()
         )
         .def("release", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::release)
         .def("num_gaussians", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::numGaussians)

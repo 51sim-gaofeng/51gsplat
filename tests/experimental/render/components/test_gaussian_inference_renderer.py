@@ -125,6 +125,78 @@ def test_render_basic():
     assert ret.metadata["channels"] == "RGBT"
 
 
+def test_active_indices_api_rejects_until_kernel_is_enabled():
+    """The indexed API is validated before its kernel implementation lands."""
+    from gsplat.experimental import GaussianInferenceRenderer
+
+    scene = make_test_scene()
+    W, H = 128, 128
+    viewmat, K = make_camera(W, H)
+    active_indices = torch.arange(
+        0,
+        scene.num_gaussians,
+        2,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    with GaussianInferenceRenderer(scene) as renderer:
+        with torch.inference_mode():
+            with pytest.raises(
+                RuntimeError,
+                match="indexed inference kernels have not been enabled",
+            ):
+                renderer.render(
+                    viewmat=viewmat,
+                    K=K,
+                    width=W,
+                    height=H,
+                    active_indices=active_indices,
+                )
+
+
+@pytest.mark.parametrize(
+    ("indices", "error_type", "message"),
+    [
+        (
+            torch.arange(4, dtype=torch.float32, device=DEVICE),
+            TypeError,
+            "dtype",
+        ),
+        (
+            torch.arange(4, dtype=torch.int32, device=DEVICE).reshape(2, 2),
+            ValueError,
+            "one-dimensional",
+        ),
+        (
+            torch.arange(4, dtype=torch.int32),
+            ValueError,
+            "CUDA tensor",
+        ),
+        (
+            torch.arange(8, dtype=torch.int32, device=DEVICE)[::2],
+            ValueError,
+            "contiguous",
+        ),
+    ],
+)
+def test_active_indices_validation(indices, error_type, message):
+    from gsplat.experimental import GaussianInferenceRenderer
+
+    scene = make_test_scene()
+    viewmat, K = make_camera(128, 128)
+    with GaussianInferenceRenderer(scene) as renderer:
+        with torch.inference_mode():
+            with pytest.raises(error_type, match=message):
+                renderer.render(
+                    viewmat=viewmat,
+                    K=K,
+                    width=128,
+                    height=128,
+                    active_indices=indices,
+                )
+
+
 # ---------------------------------------------------------------------------
 # Repeated rendering
 # ---------------------------------------------------------------------------

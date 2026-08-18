@@ -155,6 +155,7 @@ class GaussianInferenceRenderer:
         eps2d: float = 0.3,
         background: Optional[Tensor] = None,
         sh_degree: Optional[int] = None,
+        active_indices: Optional[Tensor] = None,
         out: Optional[RenderReturn] = None,
         **kwargs: Any,
     ) -> RenderReturn:
@@ -183,6 +184,10 @@ class GaussianInferenceRenderer:
         sh_degree : int, optional
             Per-frame SH degree (clamped to scene max in C++).  Defaults to
             the scene's SH degree.
+        active_indices : Tensor, optional
+            One-dimensional CUDA index tensor selecting a compact subset from
+            the packed scene. Indexed kernel execution is added separately;
+            until then a non-None tensor raises an explicit runtime error.
         out : RenderReturn, optional
             Pre-allocated half4 output buffer to write into.
 
@@ -246,6 +251,27 @@ class GaussianInferenceRenderer:
                 f"got device={background.device}, "
                 f"contiguous={background.is_contiguous()}"
             )
+        if active_indices is not None:
+            if (
+                not active_indices.is_cuda
+                or active_indices.device != scene_device
+            ):
+                raise ValueError(
+                    "active_indices must be a CUDA tensor on "
+                    f"{scene_device}; got device={active_indices.device}"
+                )
+            if active_indices.dtype not in (torch.int32, torch.int64):
+                raise TypeError(
+                    "active_indices must have dtype torch.int32 or "
+                    f"torch.int64; got {active_indices.dtype}"
+                )
+            if active_indices.ndim != 1:
+                raise ValueError(
+                    "active_indices must be one-dimensional; got shape "
+                    f"{tuple(active_indices.shape)}"
+                )
+            if not active_indices.is_contiguous():
+                raise ValueError("active_indices must be contiguous")
 
         # -- tile_size -----------------------------------------------------
         effective_tile_size = tile_size if tile_size is not None else self._tile_size
@@ -285,6 +311,7 @@ class GaussianInferenceRenderer:
             self._scene.sh_compression_mode,
             background,
             out_rgbt,
+            active_indices,
         )
 
         # -- Package result ------------------------------------------------
