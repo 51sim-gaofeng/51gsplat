@@ -67,6 +67,23 @@ def make_test_scene(sh_degree=3, sh_compression="none"):
     )
 
 
+def make_packed_subset(scene, indices):
+    from gsplat.experimental import GaussianInferenceScene
+
+    subset = GaussianInferenceScene(id="test_subset")
+    subset.put(
+        "subset",
+        {
+            "means_planar": scene.means_planar[:, indices].contiguous(),
+            "qso_packed": scene.qso_packed[indices].contiguous(),
+            "colors_packed": scene.colors_packed[indices].contiguous(),
+            "sh_degree": scene.sh_degree,
+            "sh_compression_mode": scene.sh_compression_mode,
+        },
+    )
+    return subset
+
+
 def make_camera(width=256, height=256):
     """Create a simple pinhole camera looking down +z."""
     focal = width / (2.0 * math.tan(math.radians(25)))
@@ -125,8 +142,7 @@ def test_render_basic():
     assert ret.metadata["channels"] == "RGBT"
 
 
-def test_active_indices_api_rejects_until_kernel_is_enabled():
-    """The indexed API is validated before its kernel implementation lands."""
+def test_active_indices_rejects_sh_until_indexed_sh_kernel_is_enabled():
     from gsplat.experimental import GaussianInferenceRenderer
 
     scene = make_test_scene()
@@ -144,7 +160,7 @@ def test_active_indices_api_rejects_until_kernel_is_enabled():
         with torch.inference_mode():
             with pytest.raises(
                 RuntimeError,
-                match="indexed inference kernels have not been enabled",
+                match="pre-activated RGB scenes only",
             ):
                 renderer.render(
                     viewmat=viewmat,
@@ -153,6 +169,96 @@ def test_active_indices_api_rejects_until_kernel_is_enabled():
                     height=H,
                     active_indices=active_indices,
                 )
+
+
+def test_active_indices_rgb_identity_matches_full_scene():
+    from gsplat.experimental import GaussianInferenceRenderer
+
+    scene = make_test_scene(sh_degree=None)
+    viewmat, K = make_camera(128, 128)
+    indices = torch.arange(
+        scene.num_gaussians,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    with GaussianInferenceRenderer(scene) as renderer:
+        with torch.inference_mode():
+            full = renderer.render(viewmat=viewmat, K=K, width=128, height=128)
+            indexed = renderer.render(
+                viewmat=viewmat,
+                K=K,
+                width=128,
+                height=128,
+                active_indices=indices,
+            )
+
+    torch.testing.assert_close(indexed.frame, full.frame, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_active_indices_rgb_subset_matches_compact_scene(dtype):
+    from gsplat.experimental import GaussianInferenceRenderer
+
+    scene = make_test_scene(sh_degree=None)
+    viewmat, K = make_camera(128, 128)
+    indices = torch.arange(0, scene.num_gaussians, 3, dtype=dtype, device=DEVICE)
+    compact_scene = make_packed_subset(scene, indices.long())
+
+    with (
+        GaussianInferenceRenderer(scene) as indexed_renderer,
+        GaussianInferenceRenderer(compact_scene) as compact_renderer,
+        torch.inference_mode(),
+    ):
+        indexed = indexed_renderer.render(
+            viewmat=viewmat,
+            K=K,
+            width=128,
+            height=128,
+            active_indices=indices,
+        )
+        compact = compact_renderer.render(
+            viewmat=viewmat,
+            K=K,
+            width=128,
+            height=128,
+        )
+
+    torch.testing.assert_close(indexed.frame, compact.frame, rtol=0, atol=0)
+
+
+def test_active_indices_rgb_empty_and_changing_counts():
+    from gsplat.experimental import GaussianInferenceRenderer
+
+    scene = make_test_scene(sh_degree=None)
+    viewmat, K = make_camera(128, 128)
+    background = torch.tensor([0.25, 0.5, 0.75], device=DEVICE)
+    counts = (0, 1, scene.num_gaussians // 2, scene.num_gaussians)
+
+    with GaussianInferenceRenderer(scene) as renderer:
+        with torch.inference_mode():
+            empty_rendered = None
+            for count in counts:
+                indices = torch.arange(count, dtype=torch.int32, device=DEVICE)
+                rendered = renderer.render(
+                    viewmat=viewmat,
+                    K=K,
+                    width=128,
+                    height=128,
+                    background=background,
+                    active_indices=indices,
+                )
+                assert rendered.frame.shape == (1, 128, 128, 4)
+                if count == 0:
+                    empty_rendered = rendered.frame.clone()
+
+    assert empty_rendered is not None
+    expected = background.to(torch.float16)
+    torch.testing.assert_close(
+        empty_rendered[0, 0, 0, :3],
+        expected,
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize(

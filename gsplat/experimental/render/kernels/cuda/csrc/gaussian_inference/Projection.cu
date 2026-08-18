@@ -46,9 +46,13 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
     const uint32_t B,
     const uint32_t C,
     const uint32_t N,
+    const uint32_t source_N,
     const float *__restrict__ means,      // [B, 3, N]
     const float *__restrict__ covars,     // [B, N, 6] optional
     const __half *__restrict__ inference, // [B, N, 8] half — packed {quat(4), scale(3), opacity(1)}
+    const void *__restrict__ active_indices,
+    const bool active_indices_int64,
+    const __half *__restrict__ source_colors,
     const float *__restrict__ viewmats,   // [B, C, 4, 4]
     const float *__restrict__ Ks,         // [B, C, 3, 3]
     const uint32_t image_width,
@@ -87,14 +91,30 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         const int32_t bid = idx / (C * N); // batch id
         const int32_t cid = (idx / N) % C; // camera id
         const int32_t gid = idx % N;       // gaussian id
+        const int64_t source_idx
+            = active_indices == nullptr
+                ? gid
+                : (active_indices_int64 ? reinterpret_cast<const int64_t *>(active_indices)[gid]
+                                        : reinterpret_cast<const int32_t *>(active_indices)[gid]);
+        if(source_idx < 0 || source_idx >= source_N)
+        {
+            return false;
+        }
+        const int32_t source_gid = static_cast<int32_t>(source_idx);
 
         // shift pointers to the current camera and gaussian
-        const float *means_b    = means + bid * 3 * N;
+        const float *means_b    = means + bid * 3 * source_N;
         const float *viewmats_b = viewmats + bid * C * 16 + cid * 16;
         const float *Ks_b       = Ks + bid * C * 9 + cid * 9;
 
         // planar [B, 3, N] layout: coalesced reads across threads
-        const vec3 mean_w = vec3(means_b[gid], means_b[N + gid], means_b[2 * N + gid]);
+        const vec3 mean_w
+            = vec3(means_b[source_gid], means_b[source_N + source_gid], means_b[2 * source_N + source_gid]);
+
+        if(source_colors != nullptr)
+        {
+            AssignAs<uint2>(colors[gid * 4], source_colors[source_gid * 4]);
+        }
 
         // glm is column-major but input is row-major
         const mat3 R = mat3(
@@ -120,7 +140,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
 
         // Wide 128-bit load of packed {quat(4), scale(3), opacity(1)} in half
         __half inference_local[8];
-        AssignAs<uint4>(inference_local[0], inference[(bid * N + gid) * 8]);
+        AssignAs<uint4>(inference_local[0], inference[(bid * source_N + source_gid) * 8]);
 
         const vec4 quat = vec4(
             __half2float(inference_local[0]),
@@ -137,7 +157,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         mat3 covar;
         if(covars != nullptr)
         {
-            const float *covars_g = covars + bid * N * 6 + gid * 6;
+            const float *covars_g = covars + bid * source_N * 6 + source_gid * 6;
 
             covar = mat3(
                 covars_g[0],
@@ -331,9 +351,13 @@ void launch_projection_fwd_kernel(
         B,
         C,
         N,
+        N,
         means.data_ptr<float>(),
         covars_ptr,
         reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
+        nullptr,
+        false,
+        nullptr,
         viewmats.data_ptr<float>(),
         Ks.data_ptr<float>(),
         image_width,
@@ -355,6 +379,73 @@ void launch_projection_fwd_kernel(
         0.f,
         SHDecodeParams{},
         nullptr
+    );
+}
+
+void launch_projection_rgb_indexed_kernel(
+    const at::Tensor means,
+    const at::Tensor inference,
+    const at::Tensor colors,
+    const at::Tensor active_indices,
+    const at::Tensor viewmats,
+    const at::Tensor Ks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float eps2d,
+    const float near_plane,
+    const float far_plane,
+    const float radius_clip,
+    const gsplat::CameraModelType camera_model,
+    at::Tensor visible,
+    at::Tensor means2d,
+    at::Tensor depths,
+    at::Tensor conics,
+    at::Tensor out_colors
+)
+{
+    const uint32_t source_N = means.size(-1);
+    const uint32_t N        = active_indices.numel();
+    const uint32_t C        = viewmats.size(-3);
+    const uint32_t B        = means.numel() / (3 * source_N);
+    const int64_t n_elements = static_cast<int64_t>(B) * C * N;
+    if(n_elements == 0)
+    {
+        return;
+    }
+
+    dim3 threads(CTA_SIZE);
+    dim3 grid((n_elements + threads.x - 1) / threads.x);
+    projection_fwd_kernel<false><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        B,
+        C,
+        N,
+        source_N,
+        means.data_ptr<float>(),
+        nullptr,
+        reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
+        active_indices.data_ptr(),
+        active_indices.scalar_type() == at::kLong,
+        reinterpret_cast<const __half *>(colors.data_ptr<at::Half>()),
+        viewmats.data_ptr<float>(),
+        Ks.data_ptr<float>(),
+        image_width,
+        image_height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        camera_model,
+        reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
+        means2d.data_ptr<float>(),
+        depths.data_ptr<float>(),
+        reinterpret_cast<__half *>(conics.data_ptr<at::Half>()),
+        nullptr,
+        0,
+        nullptr,
+        0.f,
+        0.f,
+        SHDecodeParams{},
+        reinterpret_cast<__half *>(out_colors.data_ptr<at::Half>())
     );
 }
 
@@ -427,9 +518,13 @@ void launch_projection_sh_fused_kernel(
             B,
             C,
             N,
+            N,
             means.data_ptr<float>(),
             covars_ptr,
             reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
+            nullptr,
+            false,
+            nullptr,
             viewmats.data_ptr<float>(),
             Ks.data_ptr<float>(),
             image_width,

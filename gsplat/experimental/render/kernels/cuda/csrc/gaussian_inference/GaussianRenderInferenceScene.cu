@@ -164,12 +164,6 @@ namespace gaussian_render_inference_scene
         // torch.inference_mode() (via check_inference_grad_mode), so adding a
         // redundant guard would cost ~2 us per frame in thread-local toggles.
         DEVICE_GUARD(scene.means_planar);
-        TORCH_CHECK(
-            !active_indices.has_value(),
-            "active_indices API is available, but indexed inference kernels "
-            "have not been enabled yet"
-        );
-
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
 
         // ---- Validate out_rgbt if provided ----
@@ -198,8 +192,39 @@ namespace gaussian_render_inference_scene
             );
         }
 
-        // ---- Early return for empty scene ----
-        if(state.num_gaussians == 0)
+        const int64_t active_count
+            = active_indices.has_value() ? active_indices.value().numel() : static_cast<int64_t>(state.num_gaussians);
+        if(active_indices.has_value())
+        {
+            const auto &indices = active_indices.value();
+            TORCH_CHECK(indices.is_cuda(), "active_indices must be a CUDA tensor");
+            TORCH_CHECK(
+                indices.device() == scene.means_planar.device(),
+                "active_indices must be on the same CUDA device as the scene"
+            );
+            TORCH_CHECK(
+                indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong,
+                "active_indices must be int32 or int64"
+            );
+            TORCH_CHECK(indices.dim() == 1, "active_indices must be one-dimensional");
+            TORCH_CHECK(indices.is_contiguous(), "active_indices must be contiguous");
+            TORCH_CHECK(
+                active_count <= static_cast<int64_t>(state.num_gaussians),
+                "active_indices length (",
+                active_count,
+                ") exceeds scene capacity (",
+                state.num_gaussians,
+                ")"
+            );
+            TORCH_CHECK(
+                state.sh_coeffs_per_channel == 0,
+                "active_indices currently supports pre-activated RGB scenes only; "
+                "indexed SH kernels are not enabled yet"
+            );
+        }
+
+        // ---- Early return for an empty scene or active set ----
+        if(state.num_gaussians == 0 || active_count == 0)
         {
             at::Tensor rgbt = out_rgbt.has_value() ? out_rgbt.value() : at::zeros({1, height, width, 4}, opts_h);
             rgbt.zero_();
@@ -268,6 +293,12 @@ namespace gaussian_render_inference_scene
         const auto &qso_packed          = scene.qso_packed;
         const auto &colors_packed       = scene.colors_packed;
         const at::Tensor *raster_colors = &state.colors;
+        const int64_t visible_words     = (active_count + 31) / 32;
+        auto active_visible             = state.visible.narrow(0, 0, visible_words);
+        auto active_means2d             = state.means2d.narrow(2, 0, active_count);
+        auto active_depths              = state.depths.narrow(2, 0, active_count);
+        auto active_conics              = state.conics.narrow(2, 0, active_count);
+        auto active_colors              = state.colors.narrow(0, 0, active_count);
 
         if(state.sh_coeffs_per_channel > 0 && compression != SHCompressionMode::NONE)
         {
@@ -298,11 +329,11 @@ namespace gaussian_render_inference_scene
                 SH_ACTIVATION_SHIFT,
                 compression,
                 decode_params,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                state.colors,
+                active_visible,
+                active_means2d,
+                active_depths,
+                active_conics,
+                active_colors,
                 {}
             );
         }
@@ -328,11 +359,11 @@ namespace gaussian_render_inference_scene
                 SH_ACTIVATION_SHIFT,
                 SHCompressionMode::NONE,
                 nullptr,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                state.colors,
+                active_visible,
+                active_means2d,
+                active_depths,
+                active_conics,
+                active_colors,
                 {}
             );
         }
@@ -352,10 +383,10 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
                 gsplat::CameraModelType::PINHOLE,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
+                active_visible,
+                active_means2d,
+                active_depths,
+                active_conics,
                 {}
             );
 
@@ -364,47 +395,71 @@ namespace gaussian_render_inference_scene
                 means,
                 viewmat,
                 colors_packed,
-                state.visible,
+                active_visible,
                 SH_ACTIVATION_SCALE,
                 SH_ACTIVATION_SHIFT,
-                state.colors
+                active_colors
             );
         }
         else
         {
-            // ---- Pre-activated RGB: projection only + copy colors ----
-            higs::launch_projection_fwd_kernel(
-                means,
-                {},
-                qso_packed,
-                viewmat_4d,
-                K_4d,
-                static_cast<uint32_t>(width),
-                static_cast<uint32_t>(height),
-                static_cast<float>(eps2d),
-                static_cast<float>(near_plane),
-                static_cast<float>(far_plane),
-                static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                {}
-            );
-
-            // colors_packed is already [N, 4] half {R, G, B, 0}
-            raster_colors = &colors_packed;
+            if(active_indices.has_value())
+            {
+                higs::launch_projection_rgb_indexed_kernel(
+                    means,
+                    qso_packed,
+                    colors_packed,
+                    active_indices.value(),
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    gsplat::CameraModelType::PINHOLE,
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    active_colors
+                );
+                raster_colors = &active_colors;
+            }
+            else
+            {
+                higs::launch_projection_fwd_kernel(
+                    means,
+                    {},
+                    qso_packed,
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    gsplat::CameraModelType::PINHOLE,
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    {}
+                );
+                raster_colors = &colors_packed;
+            }
         }
 
         // ==================================================================
         // Intersection + Rasterization (fused macro-tile path)
         // ==================================================================
         state.isect->execute(
-            state.means2d,
-            state.depths,
-            state.conics,
-            state.visible,
+            active_means2d,
+            active_depths,
+            active_conics,
+            active_visible,
             static_cast<int32_t>(tile_size),
             static_cast<int32_t>(tw),
             static_cast<int32_t>(th),
@@ -412,8 +467,8 @@ namespace gaussian_render_inference_scene
         );
 
         state.isect->rasterize(
-            state.means2d,
-            state.conics,
+            active_means2d,
+            active_conics,
             *raster_colors,
             state.background,
             static_cast<uint32_t>(width),

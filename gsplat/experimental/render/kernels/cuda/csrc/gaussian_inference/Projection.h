@@ -52,6 +52,31 @@ void launch_projection_fwd_kernel(
     at::optional<at::Tensor> compensations // [1, 1, N] optional
 );
 
+// Projection-only launch over a compact active set. Source attributes are read
+// through active_indices while all outputs use compact active-slot indexing.
+void launch_projection_rgb_indexed_kernel(
+    // source pool inputs
+    const at::Tensor means,          // [3, source_N]
+    const at::Tensor inference,      // [source_N, 8] half
+    const at::Tensor colors,         // [source_N, 4] half
+    const at::Tensor active_indices, // [active_N] int32/int64
+    const at::Tensor viewmats,       // [1, 1, 4, 4]
+    const at::Tensor Ks,             // [1, 1, 3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float eps2d,
+    const float near_plane,
+    const float far_plane,
+    const float radius_clip,
+    const gsplat::CameraModelType camera_model,
+    // compact active-slot outputs
+    at::Tensor visible, // [(active_N+31)/32] int32 packed bitfield
+    at::Tensor means2d, // [1, 1, active_N, 2]
+    at::Tensor depths,  // [1, 1, active_N]
+    at::Tensor conics,  // [1, 1, active_N, 4] half
+    at::Tensor out_colors // [active_N, 4] half
+);
+
 // Fused projection + SH evaluation launch (FUSE_SH=true).
 // Camera world position is derived from viewmats inside the kernel.
 void launch_projection_sh_fused_kernel(
