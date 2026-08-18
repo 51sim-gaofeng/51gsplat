@@ -280,7 +280,16 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
             const float inorm  = rsqrtf(dx * dx + dy * dy + dz * dz);
             const float3 dir_n = make_float3(dx * inorm, dy * inorm, dz * inorm);
             EvalSHForGaussian<SH_MODE>(
-                dir_n, gid, N, degrees_to_use, sh_input, sh_bias, sh_min_value, sh_decode_params, colors
+                dir_n,
+                source_gid,
+                source_N,
+                gid,
+                degrees_to_use,
+                sh_input,
+                sh_bias,
+                sh_min_value,
+                sh_decode_params,
+                colors
             );
         }
 
@@ -382,10 +391,10 @@ void launch_projection_fwd_kernel(
     );
 }
 
-void launch_projection_rgb_indexed_kernel(
+void launch_projection_indexed_kernel(
     const at::Tensor means,
     const at::Tensor inference,
-    const at::Tensor colors,
+    const at::optional<at::Tensor> colors,
     const at::Tensor active_indices,
     const at::Tensor viewmats,
     const at::Tensor Ks,
@@ -400,7 +409,7 @@ void launch_projection_rgb_indexed_kernel(
     at::Tensor means2d,
     at::Tensor depths,
     at::Tensor conics,
-    at::Tensor out_colors
+    const at::optional<at::Tensor> &out_colors
 )
 {
     const uint32_t source_N = means.size(-1);
@@ -425,7 +434,7 @@ void launch_projection_rgb_indexed_kernel(
         reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
         active_indices.data_ptr(),
         active_indices.scalar_type() == at::kLong,
-        reinterpret_cast<const __half *>(colors.data_ptr<at::Half>()),
+        colors.has_value() ? reinterpret_cast<const __half *>(colors.value().data_ptr<at::Half>()) : nullptr,
         viewmats.data_ptr<float>(),
         Ks.data_ptr<float>(),
         image_width,
@@ -445,7 +454,7 @@ void launch_projection_rgb_indexed_kernel(
         0.f,
         0.f,
         SHDecodeParams{},
-        reinterpret_cast<__half *>(out_colors.data_ptr<at::Half>())
+        out_colors.has_value() ? reinterpret_cast<__half *>(out_colors.value().data_ptr<at::Half>()) : nullptr
     );
 }
 
@@ -470,6 +479,7 @@ void launch_projection_sh_fused_kernel(
     const float min_value,
     const SHCompressionMode mode,
     const SHDecodeParams *decode_params,
+    const at::optional<at::Tensor> &active_indices,
     // outputs
     at::Tensor visible,
     at::Tensor means2d,
@@ -479,9 +489,10 @@ void launch_projection_sh_fused_kernel(
     at::optional<at::Tensor> compensations
 )
 {
-    uint32_t N = means.size(-1);
+    uint32_t source_N = means.size(-1);
+    uint32_t N = active_indices.has_value() ? active_indices.value().numel() : source_N;
     uint32_t C = viewmats.size(-3);
-    uint32_t B = means.numel() / (3 * N);
+    uint32_t B = means.numel() / (3 * source_N);
 
     int64_t n_elements = B * C * N;
     dim3 threads(CTA_SIZE);
@@ -518,12 +529,12 @@ void launch_projection_sh_fused_kernel(
             B,
             C,
             N,
-            N,
+            source_N,
             means.data_ptr<float>(),
             covars_ptr,
             reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
-            nullptr,
-            false,
+            active_indices.has_value() ? active_indices.value().data_ptr() : nullptr,
+            active_indices.has_value() && active_indices.value().scalar_type() == at::kLong,
             nullptr,
             viewmats.data_ptr<float>(),
             Ks.data_ptr<float>(),

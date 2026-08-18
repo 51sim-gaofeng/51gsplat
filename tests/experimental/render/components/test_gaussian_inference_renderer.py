@@ -142,33 +142,81 @@ def test_render_basic():
     assert ret.metadata["channels"] == "RGBT"
 
 
-def test_active_indices_rejects_sh_until_indexed_sh_kernel_is_enabled():
+@pytest.mark.parametrize(
+    ("sh_degree", "sh_compression"),
+    [(1, "none"), (3, "none")],
+)
+def test_active_indices_sh_subset_matches_compact_scene(
+    sh_degree, sh_compression
+):
     from gsplat.experimental import GaussianInferenceRenderer
 
-    scene = make_test_scene()
-    W, H = 128, 128
-    viewmat, K = make_camera(W, H)
-    active_indices = torch.arange(
-        0,
-        scene.num_gaussians,
-        2,
-        dtype=torch.int32,
-        device=DEVICE,
+    scene = make_test_scene(
+        sh_degree=sh_degree,
+        sh_compression=sh_compression,
     )
+    viewmat, K = make_camera(128, 128)
+    indices = torch.arange(
+        0, scene.num_gaussians, 3, dtype=torch.int32, device=DEVICE
+    )
+    compact_scene = make_packed_subset(scene, indices.long())
+
+    with (
+        GaussianInferenceRenderer(scene) as indexed_renderer,
+        GaussianInferenceRenderer(compact_scene) as compact_renderer,
+        torch.inference_mode(),
+    ):
+        indexed = indexed_renderer.render(
+            viewmat=viewmat,
+            K=K,
+            width=128,
+            height=128,
+            active_indices=indices,
+        )
+        compact = compact_renderer.render(
+            viewmat=viewmat,
+            K=K,
+            width=128,
+            height=128,
+        )
+
+    torch.testing.assert_close(indexed.frame, compact.frame, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sh_compression", ["16b", "32b"])
+def test_active_indices_compressed_sh_subset_matches_opacity_mask(
+    sh_compression,
+):
+    from gsplat.experimental import GaussianInferenceRenderer
+
+    scene = make_test_scene(sh_degree=3, sh_compression=sh_compression)
+    viewmat, K = make_camera(128, 128)
+    indices = torch.arange(
+        0, scene.num_gaussians, 3, dtype=torch.int32, device=DEVICE
+    )
+    selected = torch.zeros(scene.num_gaussians, dtype=torch.bool, device=DEVICE)
+    selected[indices.long()] = True
 
     with GaussianInferenceRenderer(scene) as renderer:
         with torch.inference_mode():
-            with pytest.raises(
-                RuntimeError,
-                match="pre-activated RGB scenes only",
-            ):
-                renderer.render(
-                    viewmat=viewmat,
-                    K=K,
-                    width=W,
-                    height=H,
-                    active_indices=active_indices,
-                )
+            indexed = renderer.render(
+                viewmat=viewmat,
+                K=K,
+                width=128,
+                height=128,
+                active_indices=indices,
+            )
+            saved_opacities = scene.qso_packed[:, 7].clone()
+            scene.qso_packed[~selected, 7] = 0
+            masked = renderer.render(
+                viewmat=viewmat,
+                K=K,
+                width=128,
+                height=128,
+            )
+            scene.qso_packed[:, 7].copy_(saved_opacities)
+
+    torch.testing.assert_close(indexed.frame, masked.frame, rtol=0, atol=0)
 
 
 def test_active_indices_rgb_identity_matches_full_scene():

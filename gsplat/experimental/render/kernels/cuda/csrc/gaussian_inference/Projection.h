@@ -54,11 +54,11 @@ void launch_projection_fwd_kernel(
 
 // Projection-only launch over a compact active set. Source attributes are read
 // through active_indices while all outputs use compact active-slot indexing.
-void launch_projection_rgb_indexed_kernel(
+void launch_projection_indexed_kernel(
     // source pool inputs
     const at::Tensor means,          // [3, source_N]
     const at::Tensor inference,      // [source_N, 8] half
-    const at::Tensor colors,         // [source_N, 4] half
+    const at::optional<at::Tensor> colors, // [source_N, 4] half, optional
     const at::Tensor active_indices, // [active_N] int32/int64
     const at::Tensor viewmats,       // [1, 1, 4, 4]
     const at::Tensor Ks,             // [1, 1, 3, 3]
@@ -74,7 +74,7 @@ void launch_projection_rgb_indexed_kernel(
     at::Tensor means2d, // [1, 1, active_N, 2]
     at::Tensor depths,  // [1, 1, active_N]
     at::Tensor conics,  // [1, 1, active_N, 4] half
-    at::Tensor out_colors // [active_N, 4] half
+    const at::optional<at::Tensor> &out_colors // [active_N, 4] half, optional
 );
 
 // Fused projection + SH evaluation launch (FUSE_SH=true).
@@ -100,6 +100,7 @@ void launch_projection_sh_fused_kernel(
     const float min_value,
     const SHCompressionMode mode,
     const SHDecodeParams *decode_params,
+    const at::optional<at::Tensor> &active_indices,
     // outputs
     at::Tensor visible,                    // [(N+31)/32] int32 packed bitfield
     at::Tensor means2d,                    // [1, 1, N, 2]

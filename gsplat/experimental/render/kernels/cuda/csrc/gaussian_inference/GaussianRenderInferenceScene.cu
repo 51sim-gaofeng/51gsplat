@@ -216,11 +216,6 @@ namespace gaussian_render_inference_scene
                 state.num_gaussians,
                 ")"
             );
-            TORCH_CHECK(
-                state.sh_coeffs_per_channel == 0,
-                "active_indices currently supports pre-activated RGB scenes only; "
-                "indexed SH kernels are not enabled yet"
-            );
         }
 
         // ---- Early return for an empty scene or active set ----
@@ -329,6 +324,7 @@ namespace gaussian_render_inference_scene
                 SH_ACTIVATION_SHIFT,
                 compression,
                 decode_params,
+                active_indices,
                 active_visible,
                 active_means2d,
                 active_depths,
@@ -359,6 +355,7 @@ namespace gaussian_render_inference_scene
                 SH_ACTIVATION_SHIFT,
                 SHCompressionMode::NONE,
                 nullptr,
+                active_indices,
                 active_visible,
                 active_means2d,
                 active_depths,
@@ -370,42 +367,78 @@ namespace gaussian_render_inference_scene
         else if(state.sh_coeffs_per_channel > 0)
         {
             // ---- Generic lower-degree SH (K != 16): projection first, then float32 SH ----
-            higs::launch_projection_fwd_kernel(
-                means,
-                {},
-                qso_packed,
-                viewmat_4d,
-                K_4d,
-                static_cast<uint32_t>(width),
-                static_cast<uint32_t>(height),
-                static_cast<float>(eps2d),
-                static_cast<float>(near_plane),
-                static_cast<float>(far_plane),
-                static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
-                active_visible,
-                active_means2d,
-                active_depths,
-                active_conics,
-                {}
-            );
-
-            higs::launch_spherical_harmonics_viewmat_fwd_kernel(
-                static_cast<int32_t>(sh_degree),
-                means,
-                viewmat,
-                colors_packed,
-                active_visible,
-                SH_ACTIVATION_SCALE,
-                SH_ACTIVATION_SHIFT,
-                active_colors
-            );
+            if(active_indices.has_value())
+            {
+                higs::launch_projection_indexed_kernel(
+                    means,
+                    qso_packed,
+                    {},
+                    active_indices.value(),
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    gsplat::CameraModelType::PINHOLE,
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    {}
+                );
+                higs::launch_spherical_harmonics_viewmat_indexed_fwd_kernel(
+                    static_cast<int32_t>(sh_degree),
+                    means,
+                    viewmat,
+                    colors_packed,
+                    active_indices.value(),
+                    active_visible,
+                    SH_ACTIVATION_SCALE,
+                    SH_ACTIVATION_SHIFT,
+                    active_colors
+                );
+            }
+            else
+            {
+                higs::launch_projection_fwd_kernel(
+                    means,
+                    {},
+                    qso_packed,
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    gsplat::CameraModelType::PINHOLE,
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    {}
+                );
+                higs::launch_spherical_harmonics_viewmat_fwd_kernel(
+                    static_cast<int32_t>(sh_degree),
+                    means,
+                    viewmat,
+                    colors_packed,
+                    active_visible,
+                    SH_ACTIVATION_SCALE,
+                    SH_ACTIVATION_SHIFT,
+                    active_colors
+                );
+            }
         }
         else
         {
             if(active_indices.has_value())
             {
-                higs::launch_projection_rgb_indexed_kernel(
+                higs::launch_projection_indexed_kernel(
                     means,
                     qso_packed,
                     colors_packed,

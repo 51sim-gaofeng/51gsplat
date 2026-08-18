@@ -745,8 +745,9 @@ __device__ __forceinline__ void EvalSHAndPack(
 template<SHInputMode MODE>
 __device__ __forceinline__ void EvalSHForGaussian(
     const float3 &dir_n,
-    int idx,
+    int source_idx,
     int N,
+    int output_idx,
     int degrees_to_use,
     const void *__restrict__ input_data,
     float bias,
@@ -756,7 +757,7 @@ __device__ __forceinline__ void EvalSHForGaussian(
 )
 {
     float sh_coeffs[16 * 3];
-    __half *pixel = colors + idx * 4;
+    __half *pixel = colors + output_idx * 4;
 
     if constexpr(MODE == SHInputMode::RAW_FLOAT || MODE == SHInputMode::RAW_HALF)
     {
@@ -765,7 +766,7 @@ __device__ __forceinline__ void EvalSHForGaussian(
         constexpr int N2 = MODE == SHInputMode::RAW_FLOAT ? 7 : 4;  // uint4 loads for degree 2
         constexpr int N3 = MODE == SHInputMode::RAW_FLOAT ? 12 : 6; // uint4 loads for degree 3
 
-        const T *elem_coeffs = static_cast<const T *>(input_data) + static_cast<int64_t>(idx) * (16 * 3);
+        const T *elem_coeffs = static_cast<const T *>(input_data) + static_cast<int64_t>(source_idx) * (16 * 3);
 
         switch(degrees_to_use)
         {
@@ -797,8 +798,8 @@ __device__ __forceinline__ void EvalSHForGaussian(
         {
             // load 2 × uint4 at stride N
             uint32_t block[8];
-            uint4 b0 = packed[idx];
-            uint4 b1 = packed[static_cast<int64_t>(N) + idx];
+            uint4 b0 = packed[source_idx];
+            uint4 b1 = packed[static_cast<int64_t>(N) + source_idx];
             AssignAs<uint4>(block[0], b0);
             AssignAs<uint4>(block[4], b1);
             sh_decode_32b(block, out_coeffs, decode_params.scales);
@@ -807,7 +808,7 @@ __device__ __forceinline__ void EvalSHForGaussian(
         {
             // load 1 × uint4 per gaussian
             uint32_t block[4];
-            uint4 b = packed[idx];
+            uint4 b = packed[source_idx];
             AssignAs<uint4>(block[0], b);
             sh_decode_16b(block, out_coeffs, decode_params.scales);
         }
