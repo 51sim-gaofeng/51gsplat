@@ -44,6 +44,7 @@ void launch_projection_fwd_kernel(
     const float far_plane,
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
     // outputs
     at::Tensor visible,                    // [(N+31)/32] int32 packed bitfield
     at::Tensor means2d,                    // [1, 1, N, 2]
@@ -81,6 +82,7 @@ void launch_projection_sh_fused_kernel(
     at::Tensor depths,                     // [1, 1, N]
     at::Tensor conics,                     // [1, 1, N, 4] half
     at::Tensor colors,                     // [N, 4] half {R,G,B,0}
-    at::optional<at::Tensor> compensations // [1, 1, N] optional
+    at::optional<at::Tensor> compensations, // [1, 1, N] optional
+    const at::optional<at::Tensor> radial_coeffs // [4] float32 (k1..k4), optional; FISHEYE-only
 );
 } // namespace higs

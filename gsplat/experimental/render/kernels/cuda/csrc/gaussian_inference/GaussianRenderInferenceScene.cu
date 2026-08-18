@@ -156,7 +156,9 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        int64_t camera_model,
+        const at::optional<at::Tensor> &radial_coeffs
     )
     {
         // NOTE: No c10::NoGradGuard here -- the Python caller already enforces
@@ -285,7 +287,7 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(near_plane),
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
+                static_cast<gsplat::CameraModelType>(camera_model),
                 static_cast<int32_t>(sh_degree),
                 state.shCompressed,
                 SH_ACTIVATION_SCALE,
@@ -297,7 +299,8 @@ namespace gaussian_render_inference_scene
                 state.depths,
                 state.conics,
                 state.colors,
-                {}
+                {},
+                radial_coeffs
             );
         }
         else if(state.sh_coeffs_per_channel == 16)
@@ -315,7 +318,7 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(near_plane),
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
+                static_cast<gsplat::CameraModelType>(camera_model),
                 static_cast<int32_t>(sh_degree),
                 colors_packed,
                 SH_ACTIVATION_SCALE,
@@ -327,7 +330,8 @@ namespace gaussian_render_inference_scene
                 state.depths,
                 state.conics,
                 state.colors,
-                {}
+                {},
+                radial_coeffs
             );
         }
         else if(state.sh_coeffs_per_channel > 0)
@@ -345,7 +349,8 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(near_plane),
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
+                static_cast<gsplat::CameraModelType>(camera_model),
+                radial_coeffs,
                 state.visible,
                 state.means2d,
                 state.depths,
@@ -379,7 +384,8 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(near_plane),
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
+                static_cast<gsplat::CameraModelType>(camera_model),
+                radial_coeffs,
                 state.visible,
                 state.means2d,
                 state.depths,
@@ -474,7 +480,9 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        int64_t camera_model,
+        const at::optional<at::Tensor> &radial_coeffs
     )
     {
         // Use the colors tensor normalized once at construction time (colors_normalized_)
@@ -502,7 +510,9 @@ namespace gaussian_render_inference_scene
             sh_degree,
             sh_compression_mode,
             background,
-            out_rgbt
+            out_rgbt,
+            camera_model,
+            radial_coeffs
         );
     }
 
@@ -645,6 +655,7 @@ namespace gaussian_render_inference_scene
         auto state = create_gaussian_render_inference_scene_state(scene, sh_compression_mode);
 
         // ---- Render via render_gaussian_inference_scene ----
+        // Compat wrapper preserves original pinhole-only, no-distortion semantics.
         at::Tensor rgbt = render_gaussian_inference_scene(
             *state,
             scene,
@@ -660,6 +671,8 @@ namespace gaussian_render_inference_scene
             sh_degree,
             sh_compression_mode,
             background,
+            at::nullopt,
+            static_cast<int64_t>(gsplat::CameraModelType::PINHOLE),
             at::nullopt
         );
 
