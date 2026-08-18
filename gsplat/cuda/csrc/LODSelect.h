@@ -35,4 +35,27 @@ void launch_lod_select_topdown_kernels(
     at::Tensor &leaf_ids,
     at::Tensor &counts
 );
+
+void launch_lod_select_active_topdown_kernels(
+    const at::Tensor &centers,
+    const at::Tensor &sizes,
+    const at::Tensor &radii,
+    const at::Tensor &children,
+    const at::Tensor &is_leaf,
+    const at::Tensor &leaf_starts,
+    const at::Tensor &leaf_lengths,
+    const at::Tensor &root_ids,
+    const at::Tensor &cam_pos,
+    const at::Tensor &w2c,
+    const at::Tensor &K,
+    int image_width,
+    int image_height,
+    float near_plane,
+    float error_threshold_px,
+    int max_depth,
+    int exact_capacity,
+    int proxy_pool_offset,
+    at::Tensor &active_ids,
+    at::Tensor &counts
+);
 } // namespace gsplat

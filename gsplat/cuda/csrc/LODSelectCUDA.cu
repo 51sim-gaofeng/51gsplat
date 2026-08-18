@@ -189,6 +189,107 @@ __global__ void traverse_level_kernel(
         next_frontier[output + 1] = right;
     }
 }
+
+__global__ void traverse_level_active_kernel(
+    int32_t launch_capacity,
+    const int32_t *__restrict__ current_count,
+    const int32_t *__restrict__ current_frontier,
+    int32_t *__restrict__ next_count,
+    int32_t *__restrict__ next_frontier,
+    const float *__restrict__ centers,
+    const float *__restrict__ sizes,
+    const float *__restrict__ radii,
+    const int32_t *__restrict__ children,
+    const bool *__restrict__ is_leaf,
+    const int64_t *__restrict__ leaf_starts,
+    const int64_t *__restrict__ leaf_lengths,
+    const float *__restrict__ cam_pos,
+    const float *__restrict__ w2c,
+    const float *__restrict__ K,
+    const float *__restrict__ frustum_planes,
+    float error_threshold_px,
+    int32_t exact_capacity,
+    int32_t proxy_pool_offset,
+    int32_t active_capacity,
+    int32_t *__restrict__ active_count,
+    int32_t *__restrict__ overflow,
+    int32_t *__restrict__ exact_leaf_count,
+    int32_t *__restrict__ proxy_count,
+    int32_t *__restrict__ active_ids
+)
+{
+    const int32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index >= launch_capacity || index >= *current_count)
+    {
+        return;
+    }
+
+    const int32_t node = current_frontier[index];
+    const float x = centers[node * 3];
+    const float y = centers[node * 3 + 1];
+    const float z = centers[node * 3 + 2];
+    if(!sphere_visible(x, y, z, radii[node], w2c, frustum_planes))
+    {
+        return;
+    }
+
+    const float dx = x - cam_pos[0];
+    const float dy = y - cam_pos[1];
+    const float dz = z - cam_pos[2];
+    const float distance = fmaxf(sqrtf(dx * dx + dy * dy + dz * dz), 1e-6f);
+    const float projected = 2.0f * sizes[node] * K[0] / distance;
+
+    if(projected <= error_threshold_px)
+    {
+        atomicAdd(proxy_count, 1);
+        const int32_t output = atomicAdd(active_count, 1);
+        if(output < active_capacity)
+        {
+            active_ids[output] = proxy_pool_offset + node;
+        }
+        else
+        {
+            atomicExch(overflow, 1);
+        }
+        return;
+    }
+
+    if(is_leaf[node])
+    {
+        const int64_t start64 = leaf_starts[node];
+        const int64_t length64 = leaf_lengths[node];
+        if(start64 < 0 || length64 < 0 || start64 + length64 > exact_capacity)
+        {
+            atomicExch(overflow, 1);
+            return;
+        }
+        const int32_t length = static_cast<int32_t>(length64);
+        atomicAdd(exact_leaf_count, 1);
+        const int32_t output = atomicAdd(active_count, length);
+        const int32_t start = static_cast<int32_t>(start64);
+        if(output <= active_capacity - length)
+        {
+            for(int32_t offset = 0; offset < length; ++offset)
+            {
+                active_ids[output + offset] = start + offset;
+            }
+        }
+        else
+        {
+            atomicExch(overflow, 1);
+        }
+        return;
+    }
+
+    const int32_t left = children[node * 2];
+    const int32_t right = children[node * 2 + 1];
+    if(left >= 0 && right >= 0)
+    {
+        const int32_t output = atomicAdd(next_count, 2);
+        next_frontier[output] = left;
+        next_frontier[output + 1] = right;
+    }
+}
 } // namespace
 
 void launch_lod_build_binary_children_kernel(
@@ -295,6 +396,99 @@ void launch_lod_select_topdown_kernels(
             proxy_ids.data_ptr<int32_t>(),
             counts.data_ptr<int32_t>() + 3,
             leaf_ids.data_ptr<int32_t>()
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+
+void launch_lod_select_active_topdown_kernels(
+    const at::Tensor &centers,
+    const at::Tensor &sizes,
+    const at::Tensor &radii,
+    const at::Tensor &children,
+    const at::Tensor &is_leaf,
+    const at::Tensor &leaf_starts,
+    const at::Tensor &leaf_lengths,
+    const at::Tensor &root_ids,
+    const at::Tensor &cam_pos,
+    const at::Tensor &w2c,
+    const at::Tensor &K,
+    int image_width,
+    int image_height,
+    float near_plane,
+    float error_threshold_px,
+    int max_depth,
+    int exact_capacity,
+    int proxy_pool_offset,
+    at::Tensor &active_ids,
+    at::Tensor &counts
+)
+{
+    const int64_t num_nodes = centers.size(0);
+    const int64_t root_count = root_ids.size(0);
+    auto options = centers.options().dtype(at::kInt);
+    auto frontier_a = at::empty({num_nodes}, options);
+    auto frontier_b = at::empty({num_nodes}, options);
+    auto frustum_planes = at::empty({5, 4}, centers.options());
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const int initialize_blocks
+        = static_cast<int>((root_count + kThreads - 1) / kThreads);
+    initialize_frontier_kernel<<<initialize_blocks, kThreads, 0, stream>>>(
+        frontier_a.data_ptr<int32_t>(),
+        counts.data_ptr<int32_t>(),
+        root_ids.const_data_ptr<int32_t>(),
+        static_cast<int32_t>(root_count),
+        K.const_data_ptr<float>(),
+        image_width,
+        image_height,
+        near_plane,
+        frustum_planes.data_ptr<float>()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    for(int level = 0; level <= max_depth; ++level)
+    {
+        const int current_slot = level & 1;
+        const int next_slot = current_slot ^ 1;
+        auto &current = current_slot == 0 ? frontier_a : frontier_b;
+        auto &next = next_slot == 0 ? frontier_a : frontier_b;
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            counts.data_ptr<int32_t>() + next_slot,
+            0,
+            sizeof(int32_t),
+            stream
+        ));
+        const int64_t theoretical_width = root_count * (int64_t{1} << level);
+        const int32_t capacity = static_cast<int32_t>(
+            std::min(theoretical_width, num_nodes)
+        );
+        const int blocks = (capacity + kThreads - 1) / kThreads;
+        traverse_level_active_kernel<<<blocks, kThreads, 0, stream>>>(
+            capacity,
+            counts.const_data_ptr<int32_t>() + current_slot,
+            current.const_data_ptr<int32_t>(),
+            counts.data_ptr<int32_t>() + next_slot,
+            next.data_ptr<int32_t>(),
+            centers.const_data_ptr<float>(),
+            sizes.const_data_ptr<float>(),
+            radii.const_data_ptr<float>(),
+            children.const_data_ptr<int32_t>(),
+            is_leaf.const_data_ptr<bool>(),
+            leaf_starts.const_data_ptr<int64_t>(),
+            leaf_lengths.const_data_ptr<int64_t>(),
+            cam_pos.const_data_ptr<float>(),
+            w2c.const_data_ptr<float>(),
+            K.const_data_ptr<float>(),
+            frustum_planes.const_data_ptr<float>(),
+            error_threshold_px,
+            exact_capacity,
+            proxy_pool_offset,
+            static_cast<int32_t>(active_ids.size(0)),
+            counts.data_ptr<int32_t>() + 2,
+            counts.data_ptr<int32_t>() + 3,
+            counts.data_ptr<int32_t>() + 4,
+            counts.data_ptr<int32_t>() + 5,
+            active_ids.data_ptr<int32_t>()
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
