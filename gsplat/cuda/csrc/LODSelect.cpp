@@ -40,6 +40,7 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     const at::Tensor &radii,
     const at::Tensor &children,
     const at::Tensor &is_leaf,
+    const at::Tensor &root_ids,
     const at::Tensor &cam_pos,
     const at::Tensor &w2c,
     const at::Tensor &K,
@@ -56,6 +57,7 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     CHECK_INPUT(radii);
     CHECK_INPUT(children);
     CHECK_INPUT(is_leaf);
+    CHECK_INPUT(root_ids);
     CHECK_INPUT(cam_pos);
     CHECK_INPUT(w2c);
     CHECK_INPUT(K);
@@ -75,6 +77,10 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
         is_leaf.sizes() == at::IntArrayRef({M}),
         "lod_select_topdown: is_leaf must be [M]"
     );
+    TORCH_CHECK(
+        root_ids.dim() == 1 && root_ids.numel() > 0,
+        "lod_select_topdown: root_ids must be non-empty [R]"
+    );
     TORCH_CHECK(cam_pos.numel() == 3, "lod_select_topdown: cam_pos must contain 3 values");
     TORCH_CHECK(w2c.sizes() == at::IntArrayRef({4, 4}), "lod_select_topdown: w2c must be [4, 4]");
     TORCH_CHECK(K.sizes() == at::IntArrayRef({3, 3}), "lod_select_topdown: K must be [3, 3]");
@@ -83,6 +89,7 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     TORCH_CHECK(radii.scalar_type() == at::kFloat, "lod_select_topdown: radii must be float32");
     TORCH_CHECK(children.scalar_type() == at::kInt, "lod_select_topdown: children must be int32");
     TORCH_CHECK(is_leaf.scalar_type() == at::kBool, "lod_select_topdown: is_leaf must be bool");
+    TORCH_CHECK(root_ids.scalar_type() == at::kInt, "lod_select_topdown: root_ids must be int32");
     TORCH_CHECK(cam_pos.scalar_type() == at::kFloat, "lod_select_topdown: cam_pos must be float32");
     TORCH_CHECK(w2c.scalar_type() == at::kFloat, "lod_select_topdown: w2c must be float32");
     TORCH_CHECK(K.scalar_type() == at::kFloat, "lod_select_topdown: K must be float32");
@@ -101,6 +108,7 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
         radii,
         children,
         is_leaf,
+        root_ids,
         cam_pos,
         w2c,
         K,

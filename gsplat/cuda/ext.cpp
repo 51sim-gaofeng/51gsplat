@@ -1244,7 +1244,7 @@ TORCH_LIBRARY(gsplat, m)
     m.def("lod_build_binary_children(Tensor parents) -> Tensor");
     m.def(
         "lod_select_topdown(Tensor centers, Tensor sizes, Tensor radii, Tensor children, Tensor is_leaf, "
-        "Tensor cam_pos, Tensor w2c, Tensor K, int image_width, int image_height, float near_plane, "
+        "Tensor root_ids, Tensor cam_pos, Tensor w2c, Tensor K, int image_width, int image_height, float near_plane, "
         "float error_threshold_px, int max_depth) -> (Tensor, Tensor)"
     );
 

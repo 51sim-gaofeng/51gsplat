@@ -22,6 +22,7 @@ void launch_lod_select_topdown_kernels(
     const at::Tensor &radii,
     const at::Tensor &children,
     const at::Tensor &is_leaf,
+    const at::Tensor &root_ids,
     const at::Tensor &cam_pos,
     const at::Tensor &w2c,
     const at::Tensor &K,

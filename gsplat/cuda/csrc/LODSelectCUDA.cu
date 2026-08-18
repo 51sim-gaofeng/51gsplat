@@ -44,6 +44,8 @@ __global__ void build_binary_children_kernel(
 __global__ void initialize_frontier_kernel(
     int32_t *__restrict__ frontier,
     int32_t *__restrict__ counts,
+    const int32_t *__restrict__ root_ids,
+    int32_t root_count,
     const float *__restrict__ K,
     int width,
     int height,
@@ -51,10 +53,15 @@ __global__ void initialize_frontier_kernel(
     float *__restrict__ frustum_planes
 )
 {
+    const int32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index < root_count)
+    {
+        frontier[index] = root_ids[index];
+    }
+
     if(blockIdx.x == 0 && threadIdx.x == 0)
     {
-        frontier[0] = 0;
-        counts[0] = 1;
+        counts[0] = root_count;
         counts[1] = 0;
         counts[2] = 0;
         counts[3] = 0;
@@ -210,6 +217,7 @@ void launch_lod_select_topdown_kernels(
     const at::Tensor &radii,
     const at::Tensor &children,
     const at::Tensor &is_leaf,
+    const at::Tensor &root_ids,
     const at::Tensor &cam_pos,
     const at::Tensor &w2c,
     const at::Tensor &K,
@@ -224,16 +232,22 @@ void launch_lod_select_topdown_kernels(
 )
 {
     const int64_t num_nodes = centers.size(0);
-    const int64_t frontier_capacity = (num_nodes + 1) / 2;
+    const int64_t root_count = root_ids.size(0);
+    const int64_t frontier_capacity = num_nodes;
     auto frontier_options = centers.options().dtype(at::kInt);
     auto frontier_a = at::empty({frontier_capacity}, frontier_options);
     auto frontier_b = at::empty({frontier_capacity}, frontier_options);
     auto frustum_planes = at::empty({5, 4}, centers.options());
     const auto stream = at::cuda::getCurrentCUDAStream();
 
-    initialize_frontier_kernel<<<1, 1, 0, stream>>>(
+    const int initialize_blocks = static_cast<int>(
+        (root_count + kThreads - 1) / kThreads
+    );
+    initialize_frontier_kernel<<<initialize_blocks, kThreads, 0, stream>>>(
         frontier_a.data_ptr<int32_t>(),
         counts.data_ptr<int32_t>(),
+        root_ids.const_data_ptr<int32_t>(),
+        static_cast<int32_t>(root_count),
         K.const_data_ptr<float>(),
         image_width,
         image_height,
@@ -256,7 +270,7 @@ void launch_lod_select_topdown_kernels(
             stream
         ));
 
-        const int64_t theoretical_width = int64_t{1} << level;
+        const int64_t theoretical_width = root_count * (int64_t{1} << level);
         const int32_t launch_capacity = static_cast<int32_t>(
             std::min(theoretical_width, frontier_capacity)
         );
