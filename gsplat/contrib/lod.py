@@ -144,6 +144,7 @@ def _rotmat_to_quat(R: Tensor) -> Tensor:
 
 
 __all__ = [
+    "CUDA_FLAT_BVH_VERSION",
     "OctreeNode",
     "build_octree_lod",
     "build_bvh_lod",
@@ -151,6 +152,8 @@ __all__ = [
     "save_lod_cache",
     "load_lod_cache",
 ]
+
+CUDA_FLAT_BVH_VERSION = 2
 
 
 @dataclass
@@ -514,6 +517,18 @@ def build_bvh_lod(
     if opacity_mode not in ("union", "mass"):
         raise ValueError(f"unsupported opacity_mode: {opacity_mode!r}")
 
+    if means.is_cuda:
+        return _build_bvh_lod_cuda_flat(
+            means,
+            quats,
+            scales,
+            opacities,
+            colors,
+            max_depth,
+            min_points_per_node,
+            opacity_mode,
+        )
+
     device = means.device
 
     # Per-point world-space 3x3 covariance, computed once (vectorized on GPU),
@@ -729,6 +744,380 @@ def build_bvh_lod(
             nodes[i].children = [nodes[n_left[i]], nodes[n_right[i]]]
 
     return nodes[root_id]
+
+
+def _segment_reduce(data: Tensor, reduce: str, lengths: Tensor) -> Tensor:
+    segment_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=data.device),
+        lengths,
+    )
+    index = segment_ids.reshape(
+        (-1,) + (1,) * (data.ndim - 1)
+    ).expand_as(data)
+    output_shape = (lengths.numel(),) + tuple(data.shape[1:])
+    if reduce in ("sum", "mean"):
+        output = data.new_zeros(output_shape)
+        output.scatter_add_(0, index, data)
+        if reduce == "mean":
+            divisor = lengths.clamp_min(1).reshape(
+                (-1,) + (1,) * (data.ndim - 1)
+            )
+            output = output / divisor
+        return output
+    if reduce == "min":
+        output = data.new_full(output_shape, float("inf"))
+        return output.scatter_reduce_(0, index, data, reduce="amin")
+    if reduce == "max":
+        output = data.new_full(output_shape, float("-inf"))
+        return output.scatter_reduce_(0, index, data, reduce="amax")
+    raise ValueError(f"unsupported segment reduction: {reduce}")
+
+
+def _eigh_symmetric_3x3(covariances: Tensor) -> tuple[Tensor, Tensor]:
+    """Use the workspace-light analytic CUDA solver when it is available."""
+    try:
+        from pytorch3d.common.workaround.symeig3x3 import symeig3x3
+    except ImportError:
+        covariance_np = covariances.detach().cpu().numpy()
+        eigvals_np, eigvecs_np = np.linalg.eigh(covariance_np)
+        return (
+            torch.from_numpy(eigvals_np).to(covariances.device),
+            torch.from_numpy(eigvecs_np).to(covariances.device),
+        )
+    return symeig3x3(covariances)
+
+
+def _build_bvh_lod_cuda_flat(
+    means: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+    opacities: Tensor,
+    colors: Tensor,
+    max_depth: int,
+    min_points_per_node: int,
+    opacity_mode: str,
+):
+    """Build the median-split hierarchy entirely as flat CUDA tensors."""
+    device = means.device
+    n = means.shape[0]
+    point_order = torch.arange(n, dtype=torch.long, device=device)
+    active_lengths = torch.tensor([n], dtype=torch.long, device=device)
+    active_parents = torch.full((1,), -1, dtype=torch.long, device=device)
+
+    parent_levels = []
+    depth_levels = []
+    count_levels = []
+    amin_levels = []
+    amax_levels = []
+    left_levels = []
+    right_levels = []
+    leaf_node_parts = []
+    leaf_point_parts = []
+    leaf_length_parts = []
+    node_cursor = 0
+
+    for depth in range(max_depth + 1):
+        segment_count = active_lengths.numel()
+        node_ids = torch.arange(
+            node_cursor,
+            node_cursor + segment_count,
+            dtype=torch.long,
+            device=device,
+        )
+        node_cursor += segment_count
+        points = means[point_order]
+        amin = _segment_reduce(points, "min", active_lengths)
+        amax = _segment_reduce(points, "max", active_lengths)
+        is_leaf = (active_lengths <= min_points_per_node) | (depth == max_depth)
+
+        parent_levels.append(active_parents)
+        depth_levels.append(torch.full_like(active_lengths, depth))
+        count_levels.append(active_lengths)
+        amin_levels.append(amin)
+        amax_levels.append(amax)
+
+        point_segments = torch.repeat_interleave(
+            torch.arange(segment_count, device=device),
+            active_lengths,
+        )
+        leaf_points_mask = is_leaf[point_segments]
+        if torch.any(is_leaf):
+            leaf_node_parts.append(node_ids[is_leaf])
+            leaf_point_parts.append(point_order[leaf_points_mask])
+            leaf_length_parts.append(active_lengths[is_leaf])
+
+        split_mask = ~is_leaf
+        split_count = int(split_mask.sum().item())
+        left = torch.full_like(active_lengths, -1)
+        right = torch.full_like(active_lengths, -1)
+        if split_count == 0:
+            left_levels.append(left)
+            right_levels.append(right)
+            break
+
+        split_nodes = node_ids[split_mask]
+        child_base = node_cursor
+        child_offsets = torch.arange(
+            split_count, dtype=torch.long, device=device
+        ) * 2
+        left[split_mask] = child_base + child_offsets
+        right[split_mask] = child_base + child_offsets + 1
+        left_levels.append(left)
+        right_levels.append(right)
+
+        axes = torch.argmax(amax - amin, dim=1)
+        point_axes = axes[point_segments]
+        split_keys = points.gather(1, point_axes[:, None]).squeeze(1)
+        key_min = amin.gather(1, axes[:, None]).squeeze(1)
+        key_extent = (
+            amax.gather(1, axes[:, None]).squeeze(1) - key_min
+        ).clamp_min(torch.finfo(torch.float32).eps)
+        normalized_keys = (
+            split_keys - key_min[point_segments]
+        ) / key_extent[point_segments]
+        sort_keys = point_segments.to(torch.float64) + (
+            normalized_keys.to(torch.float64) * (1.0 - 2.0**-24)
+        )
+        point_order = point_order[torch.argsort(sort_keys, stable=True)]
+
+        split_lengths = active_lengths[split_mask]
+        left_lengths = torch.div(split_lengths, 2, rounding_mode="floor")
+        right_lengths = split_lengths - left_lengths
+        active_lengths = torch.stack(
+            [left_lengths, right_lengths], dim=1
+        ).reshape(-1)
+        active_parents = split_nodes.repeat_interleave(2)
+
+        sorted_segments = torch.repeat_interleave(
+            torch.arange(segment_count, device=device),
+            count_levels[-1],
+        )
+        point_order = point_order[split_mask[sorted_segments]]
+    else:
+        raise RuntimeError("BVH construction exceeded max_depth")
+
+    parents = torch.cat(parent_levels)
+    depths = torch.cat(depth_levels)
+    amins = torch.cat(amin_levels)
+    amaxs = torch.cat(amax_levels)
+    left_children = torch.cat(left_levels)
+    right_children = torch.cat(right_levels)
+    num_nodes = parents.numel()
+
+    subtree_sizes = torch.ones(num_nodes, dtype=torch.long, device=device)
+    for depth in range(int(depths[-1].item()), -1, -1):
+        nodes = torch.nonzero(depths == depth, as_tuple=False).squeeze(1)
+        internal = left_children[nodes] >= 0
+        nodes = nodes[internal]
+        if nodes.numel() > 0:
+            subtree_sizes[nodes] += (
+                subtree_sizes[left_children[nodes]]
+                + subtree_sizes[right_children[nodes]]
+            )
+
+    preorder = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    for depth in range(int(depths[-1].item()) + 1):
+        nodes = torch.nonzero(
+            (depths == depth) & (left_children >= 0),
+            as_tuple=False,
+        ).squeeze(1)
+        if nodes.numel() > 0:
+            left = left_children[nodes]
+            right = right_children[nodes]
+            preorder[left] = preorder[nodes] + 1
+            preorder[right] = preorder[left] + subtree_sizes[left]
+    old_by_preorder = torch.argsort(preorder)
+    preorder_of_old = torch.empty_like(old_by_preorder)
+    preorder_of_old[old_by_preorder] = torch.arange(
+        num_nodes, dtype=torch.long, device=device
+    )
+
+    leaf_nodes = torch.cat(leaf_node_parts)
+    leaf_points = torch.cat(leaf_point_parts)
+    leaf_lengths = torch.cat(leaf_length_parts)
+    leaf_preorder = preorder_of_old[leaf_nodes]
+    leaf_order = torch.argsort(leaf_preorder)
+    leaf_nodes = leaf_nodes[leaf_order]
+    leaf_lengths = leaf_lengths[leaf_order]
+    gathered_leaf_points = torch.cat(leaf_point_parts)
+    gathered_leaf_nodes = torch.repeat_interleave(
+        torch.cat(leaf_node_parts),
+        torch.cat(leaf_length_parts),
+    )
+    gathered_order = torch.argsort(preorder_of_old[gathered_leaf_nodes])
+    exact_indices = gathered_leaf_points[gathered_order]
+
+    rotmats = normalized_quat_to_rotmat(quats)
+    covars = (
+        rotmats
+        @ torch.diag_embed(scales.square())
+        @ rotmats.transpose(-1, -2)
+    )
+    exact_means = means[exact_indices]
+    exact_covars = covars[exact_indices]
+    exact_opacities = opacities[exact_indices].clamp(0.0, 1.0)
+    exact_colors = colors[exact_indices]
+    exact_volumes = scales[exact_indices].prod(dim=1)
+
+    weights = exact_opacities
+    weight_sums = _segment_reduce(weights, "sum", leaf_lengths)
+    safe_sums = weight_sums.clamp_min(1e-12)
+    weighted_means = _segment_reduce(
+        exact_means * weights[:, None], "sum", leaf_lengths
+    )
+    leaf_means = weighted_means / safe_sums[:, None]
+    zero_weight_leaves = weight_sums <= 1e-12
+    if torch.any(zero_weight_leaves):
+        uniform_means = _segment_reduce(exact_means, "mean", leaf_lengths)
+        leaf_means[zero_weight_leaves] = uniform_means[zero_weight_leaves]
+    repeated_leaf_means = torch.repeat_interleave(leaf_means, leaf_lengths, 0)
+    delta = exact_means - repeated_leaf_means
+    second_moments = exact_covars + delta[:, :, None] * delta[:, None, :]
+    leaf_covars = _segment_reduce(
+        second_moments * weights[:, None, None], "sum", leaf_lengths
+    ) / safe_sums[:, None, None]
+    if torch.any(zero_weight_leaves):
+        uniform_covars = _segment_reduce(second_moments, "mean", leaf_lengths)
+        leaf_covars[zero_weight_leaves] = uniform_covars[zero_weight_leaves]
+    color_shape = exact_colors.shape[1:]
+    flat_colors = exact_colors.reshape(n, -1)
+    leaf_colors = _segment_reduce(
+        flat_colors * weights[:, None], "sum", leaf_lengths
+    ) / safe_sums[:, None]
+    if torch.any(zero_weight_leaves):
+        uniform_colors = _segment_reduce(flat_colors, "mean", leaf_lengths)
+        leaf_colors[zero_weight_leaves] = uniform_colors[zero_weight_leaves]
+    leaf_alpha = 1.0 - torch.exp(
+        _segment_reduce(
+            torch.log1p(-exact_opacities),
+            "sum",
+            leaf_lengths,
+        )
+    )
+    leaf_mass = _segment_reduce(
+        exact_opacities * exact_volumes, "sum", leaf_lengths
+    )
+
+    node_means = means.new_empty((num_nodes, 3))
+    node_covars = means.new_empty((num_nodes, 3, 3))
+    node_colors = colors.new_empty((num_nodes,) + color_shape)
+    node_alpha = opacities.new_empty(num_nodes)
+    node_mass = opacities.new_empty(num_nodes)
+    node_weights = opacities.new_empty(num_nodes)
+    node_means[leaf_nodes] = leaf_means
+    node_covars[leaf_nodes] = leaf_covars
+    node_colors[leaf_nodes] = leaf_colors.reshape((-1,) + color_shape)
+    node_alpha[leaf_nodes] = leaf_alpha
+    node_mass[leaf_nodes] = leaf_mass
+    node_weights[leaf_nodes] = weight_sums
+
+    max_built_depth = int(depths[-1].item())
+    for depth in range(max_built_depth - 1, -1, -1):
+        nodes = torch.nonzero(
+            (depths == depth) & (left_children >= 0),
+            as_tuple=False,
+        ).squeeze(1)
+        if nodes.numel() == 0:
+            continue
+        left = left_children[nodes]
+        right = right_children[nodes]
+        wa = node_weights[left]
+        wb = node_weights[right]
+        total = wa + wb
+        safe_total = total.clamp_min(1e-12)
+        mean = (
+            wa[:, None] * node_means[left]
+            + wb[:, None] * node_means[right]
+        ) / safe_total[:, None]
+        zero_weight = total <= 1e-12
+        mean[zero_weight] = 0.5 * (
+            node_means[left][zero_weight] + node_means[right][zero_weight]
+        )
+        da = node_means[left] - mean
+        db = node_means[right] - mean
+        covariance = (
+            wa[:, None, None]
+            * (node_covars[left] + da[:, :, None] * da[:, None, :])
+            + wb[:, None, None]
+            * (node_covars[right] + db[:, :, None] * db[:, None, :])
+        ) / safe_total[:, None, None]
+        covariance[zero_weight] = 0.5 * (
+            node_covars[left][zero_weight] + node_covars[right][zero_weight]
+        )
+        color = (
+            wa.reshape((-1,) + (1,) * len(color_shape))
+            * node_colors[left]
+            + wb.reshape((-1,) + (1,) * len(color_shape))
+            * node_colors[right]
+        ) / safe_total.reshape((-1,) + (1,) * len(color_shape))
+        color[zero_weight] = 0.5 * (
+            node_colors[left][zero_weight] + node_colors[right][zero_weight]
+        )
+        node_means[nodes] = mean
+        node_covars[nodes] = covariance
+        node_colors[nodes] = color
+        node_alpha[nodes] = 1.0 - (
+            1.0 - node_alpha[left]
+        ) * (1.0 - node_alpha[right])
+        node_mass[nodes] = node_mass[left] + node_mass[right]
+        node_weights[nodes] = total
+
+    symmetric_covars = 0.5 * (
+        node_covars + node_covars.transpose(-1, -2)
+    )
+    eigvals, eigvecs = _eigh_symmetric_3x3(symmetric_covars)
+    reflected = torch.linalg.det(eigvecs) < 0
+    eigvecs[reflected, :, -1] *= -1
+    proxy_scales = eigvals.clamp_min(1e-12).sqrt()
+    proxy_quats = _rotmat_to_quat(eigvecs)
+    if opacity_mode == "mass":
+        proxy_opacities = (
+            node_mass / proxy_scales.prod(dim=1).clamp_min(1e-12)
+        ).clamp(0.0, 1.0)
+    else:
+        proxy_opacities = node_alpha
+
+    reordered_parent = parents[old_by_preorder]
+    reordered_parent = torch.where(
+        reordered_parent >= 0,
+        preorder_of_old[reordered_parent.clamp_min(0)],
+        reordered_parent,
+    )
+    reordered_leaf_nodes = preorder_of_old[leaf_nodes]
+    leaf_starts = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    leaf_lens = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    starts = torch.cat(
+        [leaf_lengths.new_zeros(1), leaf_lengths.cumsum(0)[:-1]]
+    )
+    leaf_starts[reordered_leaf_nodes] = starts
+    leaf_lens[reordered_leaf_nodes] = leaf_lengths
+
+    root = _CachedLODRoot()
+    root._node_center = 0.5 * (
+        amins[old_by_preorder] + amaxs[old_by_preorder]
+    )
+    root._node_radius = 0.5 * torch.linalg.vector_norm(
+        amaxs[old_by_preorder] - amins[old_by_preorder], dim=1
+    )
+    root._node_size = root._node_radius
+    root._node_is_leaf = left_children[old_by_preorder] < 0
+    root._node_parent = reordered_parent
+    root._node_leaf_start = leaf_starts
+    root._node_leaf_len = leaf_lens
+    root._flat_proxy_means = node_means[old_by_preorder]
+    root._flat_proxy_quats = proxy_quats[old_by_preorder]
+    root._flat_proxy_scales = proxy_scales[old_by_preorder]
+    root._flat_proxy_opacities = proxy_opacities[old_by_preorder]
+    root._flat_proxy_colors = node_colors[old_by_preorder]
+    root._flat_leaf_means = exact_means
+    root._flat_leaf_quats = quats[exact_indices]
+    root._flat_leaf_scales = scales[exact_indices]
+    root._flat_leaf_opacities = opacities[exact_indices]
+    root._flat_leaf_colors = exact_colors
+    root._num_nodes = num_nodes
+    root._leaf_index_device = device
+    _cast_flat_fp16(root)
+    return root
 
 
 @dataclass
