@@ -125,6 +125,80 @@ __device__ __forceinline__ bool sphere_visible(
     return true;
 }
 
+// Node visibility + on-screen size that matches the render camera model.
+// PINHOLE keeps the frustum-plane test; FISHEYE (camera_model==2) uses OpenCV
+// 4-coeff equidistant projection (r = f*theta_d) so wide-FoV edges are not
+// clipped by a pinhole frustum and proxy sizing matches the fisheye render.
+__device__ __forceinline__ void node_visibility_and_size(
+    const float x,
+    const float y,
+    const float z,
+    const float radius,
+    const float size,
+    const float *cam_pos,
+    const float *w2c,
+    const float *K,
+    const float *frustum_planes,
+    const int camera_model,
+    const float k1,
+    const float k2,
+    const float k3,
+    const float k4,
+    const int image_width,
+    const int image_height,
+    const float near_full_dist,
+    bool &visible,
+    float &projected
+)
+{
+    const float dx = x - cam_pos[0];
+    const float dy = y - cam_pos[1];
+    const float dz = z - cam_pos[2];
+    const float distance = fmaxf(sqrtf(dx * dx + dy * dy + dz * dz), 1e-6f);
+
+    if(camera_model == 2) // FISHEYE
+    {
+        const float px = w2c[0] * x + w2c[1] * y + w2c[2] * z + w2c[3];
+        const float py = w2c[4] * x + w2c[5] * y + w2c[6] * z + w2c[7];
+        const float pz = w2c[8] * x + w2c[9] * y + w2c[10] * z + w2c[11];
+        const float fx = K[0];
+        const float fy = K[4];
+        const float cx = K[2];
+        const float cy = K[5];
+        const float rho = sqrtf(px * px + py * py);
+        const float theta = atan2f(rho, pz);
+        // Angular-cone visibility: the fisheye field is a cone, not a pixel box.
+        // A pixel-box test drops near-camera nodes whose center projects just
+        // outside the frame (steep ground under a narrow vertical FoV) even
+        // though the node still covers on-screen pixels -> holes. Bound by the
+        // image-corner angle (equidistant approx) and widen by the node's
+        // angular radius so boundary-straddling nodes are kept.
+        const float corner_x = fmaxf(cx, static_cast<float>(image_width) - cx);
+        const float corner_y = fmaxf(cy, static_cast<float>(image_height) - cy);
+        const float r_corner = sqrtf(corner_x * corner_x + corner_y * corner_y);
+        const float theta_max = r_corner / fmaxf(fminf(fx, fy), 1e-6f);
+        const float ang_r = radius / distance;
+        visible = (theta - ang_r) <= theta_max;
+        const float t2 = theta * theta;
+        const float t4 = t2 * t2;
+        const float t6 = t4 * t2;
+        const float t8 = t4 * t4;
+        const float s_prime = 1.0f + 3.0f * k1 * t2 + 5.0f * k2 * t4
+            + 7.0f * k3 * t6 + 9.0f * k4 * t8;
+        projected = 2.0f * size / distance * fx * fmaxf(s_prime, 0.05f);
+    }
+    else
+    {
+        visible = sphere_visible(x, y, z, radius, w2c, frustum_planes);
+        projected = 2.0f * size * K[0] / distance;
+    }
+    // Near nodes: force refinement to exact leaves so close-up detail is kept.
+    if(near_full_dist > 0.0f && distance < near_full_dist)
+    {
+        projected = 1e30f;
+    }
+}
+
 __global__ void traverse_level_kernel(
     int32_t launch_capacity,
     const int32_t *__restrict__ current_count,
@@ -140,7 +214,15 @@ __global__ void traverse_level_kernel(
     const float *__restrict__ w2c,
     const float *__restrict__ K,
     const float *__restrict__ frustum_planes,
+    int camera_model,
+    float k1,
+    float k2,
+    float k3,
+    float k4,
+    int image_width,
+    int image_height,
     float error_threshold_px,
+    float near_full_dist,
     int32_t *__restrict__ proxy_count,
     int32_t *__restrict__ proxy_ids,
     int32_t *__restrict__ leaf_count,
@@ -157,16 +239,18 @@ __global__ void traverse_level_kernel(
     const float x = centers[node * 3];
     const float y = centers[node * 3 + 1];
     const float z = centers[node * 3 + 2];
-    if(!sphere_visible(x, y, z, radii[node], w2c, frustum_planes))
+    bool visible;
+    float projected;
+    node_visibility_and_size(
+        x, y, z, radii[node], sizes[node],
+        cam_pos, w2c, K, frustum_planes,
+        camera_model, k1, k2, k3, k4, image_width, image_height,
+        near_full_dist,
+        visible, projected);
+    if(!visible)
     {
         return;
     }
-
-    const float dx = x - cam_pos[0];
-    const float dy = y - cam_pos[1];
-    const float dz = z - cam_pos[2];
-    const float distance = fmaxf(sqrtf(dx * dx + dy * dy + dz * dz), 1e-6f);
-    const float projected = 2.0f * sizes[node] * K[0] / distance;
 
     if(projected <= error_threshold_px)
     {
@@ -207,7 +291,15 @@ __global__ void traverse_level_active_kernel(
     const float *__restrict__ w2c,
     const float *__restrict__ K,
     const float *__restrict__ frustum_planes,
+    int camera_model,
+    float k1,
+    float k2,
+    float k3,
+    float k4,
+    int image_width,
+    int image_height,
     float error_threshold_px,
+    float near_full_dist,
     int32_t exact_capacity,
     int32_t proxy_pool_offset,
     int32_t active_capacity,
@@ -228,16 +320,18 @@ __global__ void traverse_level_active_kernel(
     const float x = centers[node * 3];
     const float y = centers[node * 3 + 1];
     const float z = centers[node * 3 + 2];
-    if(!sphere_visible(x, y, z, radii[node], w2c, frustum_planes))
+    bool visible;
+    float projected;
+    node_visibility_and_size(
+        x, y, z, radii[node], sizes[node],
+        cam_pos, w2c, K, frustum_planes,
+        camera_model, k1, k2, k3, k4, image_width, image_height,
+        near_full_dist,
+        visible, projected);
+    if(!visible)
     {
         return;
     }
-
-    const float dx = x - cam_pos[0];
-    const float dy = y - cam_pos[1];
-    const float dz = z - cam_pos[2];
-    const float distance = fmaxf(sqrtf(dx * dx + dy * dy + dz * dz), 1e-6f);
-    const float projected = 2.0f * sizes[node] * K[0] / distance;
 
     if(projected <= error_threshold_px)
     {
@@ -322,10 +416,16 @@ void launch_lod_select_topdown_kernels(
     const at::Tensor &cam_pos,
     const at::Tensor &w2c,
     const at::Tensor &K,
+    int camera_model,
+    float k1,
+    float k2,
+    float k3,
+    float k4,
     int image_width,
     int image_height,
     float near_plane,
     float error_threshold_px,
+    float near_full_dist,
     int max_depth,
     at::Tensor &proxy_ids,
     at::Tensor &leaf_ids,
@@ -391,7 +491,12 @@ void launch_lod_select_topdown_kernels(
             w2c.const_data_ptr<float>(),
             K.const_data_ptr<float>(),
             frustum_planes.const_data_ptr<float>(),
+            camera_model,
+            k1, k2, k3, k4,
+            image_width,
+            image_height,
             error_threshold_px,
+            near_full_dist,
             counts.data_ptr<int32_t>() + 2,
             proxy_ids.data_ptr<int32_t>(),
             counts.data_ptr<int32_t>() + 3,
@@ -413,10 +518,16 @@ void launch_lod_select_active_topdown_kernels(
     const at::Tensor &cam_pos,
     const at::Tensor &w2c,
     const at::Tensor &K,
+    int camera_model,
+    float k1,
+    float k2,
+    float k3,
+    float k4,
     int image_width,
     int image_height,
     float near_plane,
     float error_threshold_px,
+    float near_full_dist,
     int max_depth,
     int exact_capacity,
     int proxy_pool_offset,
@@ -480,7 +591,12 @@ void launch_lod_select_active_topdown_kernels(
             w2c.const_data_ptr<float>(),
             K.const_data_ptr<float>(),
             frustum_planes.const_data_ptr<float>(),
+            camera_model,
+            k1, k2, k3, k4,
+            image_width,
+            image_height,
             error_threshold_px,
+            near_full_dist,
             exact_capacity,
             proxy_pool_offset,
             static_cast<int32_t>(active_ids.size(0)),

@@ -70,6 +70,7 @@ void launch_projection_indexed_kernel(
     const float far_plane,
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
     // compact active-slot outputs
     at::Tensor visible, // [(active_N+31)/32] int32 packed bitfield
     at::Tensor means2d, // [1, 1, active_N, 2]

@@ -49,7 +49,10 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     int64_t image_height,
     double near_plane,
     double error_threshold_px,
-    int64_t max_depth
+    double near_full_dist,
+    int64_t max_depth,
+    int64_t camera_model,
+    const at::optional<at::Tensor> &radial_coeffs
 )
 {
     DEVICE_GUARD(centers);
@@ -98,6 +101,15 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     TORCH_CHECK(image_width > 0 && image_height > 0, "lod_select_topdown: image dimensions must be positive");
     TORCH_CHECK(max_depth >= 0 && max_depth < 31, "lod_select_topdown: max_depth must be in [0, 30]");
 
+    float k1 = 0.0f, k2 = 0.0f, k3 = 0.0f, k4 = 0.0f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "lod_select_topdown: radial_coeffs must have >= 4 elements");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0]; k2 = rc_ptr[1]; k3 = rc_ptr[2]; k4 = rc_ptr[3];
+    }
+
     auto int_options = centers.options().dtype(at::kInt);
     auto proxy_ids = at::empty({M}, int_options);
     auto leaf_ids = at::empty({M}, int_options);
@@ -113,10 +125,13 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
         cam_pos,
         w2c,
         K,
+        static_cast<int>(camera_model),
+        k1, k2, k3, k4,
         static_cast<int>(image_width),
         static_cast<int>(image_height),
         static_cast<float>(near_plane),
         static_cast<float>(error_threshold_px),
+        static_cast<float>(near_full_dist),
         static_cast<int>(max_depth),
         proxy_ids,
         leaf_ids,
@@ -161,9 +176,12 @@ std::tuple<at::Tensor, int64_t, int64_t> lod_select_active_topdown(
     int64_t image_height,
     double near_plane,
     double error_threshold_px,
+    double near_full_dist,
     int64_t max_depth,
     int64_t exact_capacity,
-    int64_t proxy_pool_offset
+    int64_t proxy_pool_offset,
+    int64_t camera_model,
+    const at::optional<at::Tensor> &radial_coeffs
 )
 {
     DEVICE_GUARD(centers);
@@ -256,6 +274,15 @@ std::tuple<at::Tensor, int64_t, int64_t> lod_select_active_topdown(
         "lod_select_active_topdown: pool exceeds int32 index range"
     );
 
+    float k1 = 0.0f, k2 = 0.0f, k3 = 0.0f, k4 = 0.0f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "lod_select_active_topdown: radial_coeffs must have >= 4 elements");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0]; k2 = rc_ptr[1]; k3 = rc_ptr[2]; k4 = rc_ptr[3];
+    }
+
     auto options = centers.options().dtype(at::kInt);
     auto active_ids = at::empty(
         {exact_capacity + centers.size(0)},
@@ -274,10 +301,13 @@ std::tuple<at::Tensor, int64_t, int64_t> lod_select_active_topdown(
         cam_pos,
         w2c,
         K,
+        static_cast<int>(camera_model),
+        k1, k2, k3, k4,
         static_cast<int>(image_width),
         static_cast<int>(image_height),
         static_cast<float>(near_plane),
         static_cast<float>(error_threshold_px),
+        static_cast<float>(near_full_dist),
         static_cast<int>(max_depth),
         static_cast<int>(exact_capacity),
         static_cast<int>(proxy_pool_offset),

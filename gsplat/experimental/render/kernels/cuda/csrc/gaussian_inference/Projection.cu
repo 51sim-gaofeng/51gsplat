@@ -486,6 +486,7 @@ void launch_projection_indexed_kernel(
     const float far_plane,
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs,
     at::Tensor visible,
     at::Tensor means2d,
     at::Tensor depths,
@@ -501,6 +502,18 @@ void launch_projection_indexed_kernel(
     if(n_elements == 0)
     {
         return;
+    }
+
+    float k1 = 0.f, k2 = 0.f, k3 = 0.f, k4 = 0.f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "radial_coeffs must have at least 4 elements (k1..k4)");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0];
+        k2 = rc_ptr[1];
+        k3 = rc_ptr[2];
+        k4 = rc_ptr[3];
     }
 
     dim3 threads(CTA_SIZE);
@@ -525,8 +538,7 @@ void launch_projection_indexed_kernel(
         far_plane,
         radius_clip,
         camera_model,
-        // indexed path does not carry radial distortion; pass zero coeffs
-        0.f, 0.f, 0.f, 0.f,
+        k1, k2, k3, k4,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
