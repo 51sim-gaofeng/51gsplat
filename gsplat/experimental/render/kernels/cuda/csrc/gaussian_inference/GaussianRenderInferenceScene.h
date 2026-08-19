@@ -120,7 +120,8 @@ namespace gaussian_render_inference_scene
         const at::optional<at::Tensor> &out_rgbt,
         int64_t camera_model = 0,
         const at::optional<at::Tensor> &radial_coeffs = at::nullopt,
-        const at::optional<at::Tensor> &active_indices = at::nullopt
+        const at::optional<at::Tensor> &active_indices = at::nullopt,
+        double fisheye_max_theta = 0.0
     );
 
     // ---------------------------------------------------------------------------
@@ -168,7 +169,8 @@ namespace gaussian_render_inference_scene
 
             int64_t camera_model = 0,
             const at::optional<at::Tensor> &radial_coeffs = at::nullopt,
-            const at::optional<at::Tensor> &active_indices = at::nullopt
+            const at::optional<at::Tensor> &active_indices = at::nullopt,
+            double fisheye_max_theta = 0.0
         );
 
         /// Release all GPU resources.

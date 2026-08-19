@@ -184,7 +184,8 @@ namespace gaussian_render_inference_scene
         const at::optional<at::Tensor> &out_rgbt,
         int64_t camera_model,
         const at::optional<at::Tensor> &radial_coeffs,
-        const at::optional<at::Tensor> &active_indices
+        const at::optional<at::Tensor> &active_indices,
+        double fisheye_max_theta
     )
     {
         // NOTE: No c10::NoGradGuard here -- the Python caller already enforces
@@ -363,7 +364,8 @@ namespace gaussian_render_inference_scene
                 active_conics,
                 active_colors,
                 {},
-                radial_coeffs
+                radial_coeffs,
+                static_cast<float>(fisheye_max_theta)
             );
         }
         else if(state.sh_coeffs_per_channel == 16)
@@ -395,7 +397,8 @@ namespace gaussian_render_inference_scene
                 active_conics,
                 active_colors,
                 {},
-                radial_coeffs
+                radial_coeffs,
+                static_cast<float>(fisheye_max_theta)
             );
         }
         else if(state.sh_coeffs_per_channel > 0)
@@ -418,6 +421,7 @@ namespace gaussian_render_inference_scene
                     static_cast<float>(radius_clip),
                     static_cast<gsplat::CameraModelType>(camera_model),
                     radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
                     active_visible,
                     active_means2d,
                     active_depths,
@@ -452,6 +456,7 @@ namespace gaussian_render_inference_scene
                     static_cast<float>(radius_clip),
                     static_cast<gsplat::CameraModelType>(camera_model),
                     radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
                     active_visible,
                     active_means2d,
                     active_depths,
@@ -490,6 +495,7 @@ namespace gaussian_render_inference_scene
                     static_cast<float>(radius_clip),
                     static_cast<gsplat::CameraModelType>(camera_model),
                     radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
                     active_visible,
                     active_means2d,
                     active_depths,
@@ -514,6 +520,7 @@ namespace gaussian_render_inference_scene
                     static_cast<float>(radius_clip),
                     static_cast<gsplat::CameraModelType>(camera_model),
                     radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
                     active_visible,
                     active_means2d,
                     active_depths,
@@ -611,7 +618,8 @@ namespace gaussian_render_inference_scene
         const at::optional<at::Tensor> &out_rgbt,
         int64_t camera_model,
         const at::optional<at::Tensor> &radial_coeffs,
-        const at::optional<at::Tensor> &active_indices
+        const at::optional<at::Tensor> &active_indices,
+        double fisheye_max_theta
     )
     {
         // Use the colors tensor normalized once at construction time (colors_normalized_)
@@ -642,7 +650,8 @@ namespace gaussian_render_inference_scene
             out_rgbt,
             camera_model,
             radial_coeffs,
-            active_indices
+            active_indices,
+            fisheye_max_theta
         );
     }
 
@@ -804,7 +813,8 @@ namespace gaussian_render_inference_scene
             at::nullopt,
             static_cast<int64_t>(gsplat::CameraModelType::PINHOLE),
             at::nullopt,
-            at::nullopt
+            at::nullopt,
+            0.0
         );
 
         // ---- Extract RGB and alpha from RGBT output ----

@@ -167,6 +167,7 @@ class GaussianInferenceRenderer:
         camera_model: Optional[Any] = None,
         radial_coeffs: Optional[Tensor] = None,
         active_indices: Optional[Tensor] = None,
+        fisheye_max_theta: float = 0.0,
         out: Optional[RenderReturn] = None,
         **kwargs: Any,
     ) -> RenderReturn:
@@ -363,6 +364,7 @@ class GaussianInferenceRenderer:
             camera_model=camera_model_int,
             radial_coeffs=radial_coeffs_t,
             active_indices=active_indices,
+            fisheye_max_theta=float(fisheye_max_theta),
         )
 
         # -- Package result ------------------------------------------------

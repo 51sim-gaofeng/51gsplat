@@ -45,6 +45,7 @@ void launch_projection_fwd_kernel(
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
     const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
+    const float fisheye_max_theta,         // >0: cull splats past this cam-space angle (rad); 0=off
     // outputs
     at::Tensor visible,                    // [(N+31)/32] int32 packed bitfield
     at::Tensor means2d,                    // [1, 1, N, 2]
@@ -71,6 +72,7 @@ void launch_projection_indexed_kernel(
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
     const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
+    const float fisheye_max_theta, // >0: cull splats past this cam-space angle (rad); 0=off
     // compact active-slot outputs
     at::Tensor visible, // [(active_N+31)/32] int32 packed bitfield
     at::Tensor means2d, // [1, 1, active_N, 2]
@@ -110,6 +112,7 @@ void launch_projection_sh_fused_kernel(
     at::Tensor conics,                     // [1, 1, N, 4] half
     at::Tensor colors,                     // [N, 4] half {R,G,B,0}
     at::optional<at::Tensor> compensations, // [1, 1, N] optional
-    const at::optional<at::Tensor> radial_coeffs // [4] float32 (k1..k4), optional; FISHEYE-only
+    const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
+    const float fisheye_max_theta // >0: cull splats past this cam-space angle (rad); 0=off
 );
 } // namespace higs

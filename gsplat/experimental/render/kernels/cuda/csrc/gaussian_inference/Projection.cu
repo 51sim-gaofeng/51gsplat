@@ -123,6 +123,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
     const float k2,
     const float k3,
     const float k4,
+    const float fisheye_max_theta,
     // outputs
     uint32_t *__restrict__ visible,    // [(B*C*N+31)/32] packed bitfield
     float *__restrict__ means2d,       // [B, C, N, 2]
@@ -218,6 +219,24 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
             __half2float(inference_local[4]), __half2float(inference_local[5]), __half2float(inference_local[6])
         );
         float opacity = __half2float(inference_local[7]);
+
+        // Fisheye field-angle cull + soft fade: past the calibrated FoV the
+        // OpenCV coeffs extrapolate and EWA covariance explodes into radial
+        // streaks. Cull beyond fisheye_max_theta; fade opacity over the last ~6deg.
+        if(camera_model == CameraModelType::FISHEYE && fisheye_max_theta > 0.f)
+        {
+            const float rho   = sqrtf(mean_c.x * mean_c.x + mean_c.y * mean_c.y);
+            const float theta = atan2f(rho, mean_c.z);
+            if(theta >= fisheye_max_theta)
+            {
+                return false;
+            }
+            const float band = 0.10471975512f; // ~6 deg fade
+            if(theta > fisheye_max_theta - band)
+            {
+                opacity *= (fisheye_max_theta - theta) / band;
+            }
+        }
 
         // transform Gaussian covariance to camera space
         mat3 covar;
@@ -392,6 +411,7 @@ void launch_projection_fwd_kernel(
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
     const at::optional<at::Tensor> radial_coeffs,
+    const float fisheye_max_theta,
     // outputs
     at::Tensor visible,
     at::Tensor means2d,
@@ -457,6 +477,7 @@ void launch_projection_fwd_kernel(
         radius_clip,
         camera_model,
         k1, k2, k3, k4,
+        fisheye_max_theta,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -487,6 +508,7 @@ void launch_projection_indexed_kernel(
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
     const at::optional<at::Tensor> radial_coeffs,
+    const float fisheye_max_theta,
     at::Tensor visible,
     at::Tensor means2d,
     at::Tensor depths,
@@ -539,6 +561,7 @@ void launch_projection_indexed_kernel(
         radius_clip,
         camera_model,
         k1, k2, k3, k4,
+        fisheye_max_theta,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -582,7 +605,8 @@ void launch_projection_sh_fused_kernel(
     at::Tensor conics,
     at::Tensor colors,
     at::optional<at::Tensor> compensations,
-    const at::optional<at::Tensor> radial_coeffs
+    const at::optional<at::Tensor> radial_coeffs,
+    const float fisheye_max_theta
 )
 {
     uint32_t source_N = means.size(-1);
@@ -654,6 +678,7 @@ void launch_projection_sh_fused_kernel(
             radius_clip,
             camera_model,
             k1, k2, k3, k4,
+            fisheye_max_theta,
             vis_ptr,
             means2d_ptr,
             depths_ptr,
