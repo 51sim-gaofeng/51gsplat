@@ -50,7 +50,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("background"),
             py::arg("out_rgbt"),
             py::arg("camera_model")   = static_cast<int64_t>(0),
-            py::arg("radial_coeffs")  = py::none()
+            py::arg("radial_coeffs")  = py::none(),
+            py::arg("active_indices") = py::none()
         )
         .def("release", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::release)
         .def("num_gaussians", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::numGaussians)
