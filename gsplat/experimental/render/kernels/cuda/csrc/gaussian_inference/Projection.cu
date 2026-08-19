@@ -41,6 +41,63 @@ using gsplat::vec2;
 using gsplat::vec3;
 using gsplat::vec4;
 
+// OpenCV fisheye (4-coefficient) distortion applied on top of equidistant fisheye_proj.
+// theta_d = theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8), t = theta.
+// Covariance uses chain-rule scaling of the fisheye Jacobian: direct-theta terms scale
+// by s = theta_d/theta; d(theta)/d(x,y,z) terms scale by phi' = d(theta_d)/d(theta).
+// With k1..k4 == 0 this reduces exactly to gsplat::fisheye_proj.
+inline __device__ void fisheye_proj_distorted(
+    const vec3 mean3d,
+    const mat3 cov3d,
+    const float fx,
+    const float fy,
+    const float cx,
+    const float cy,
+    const uint32_t /*width*/,
+    const uint32_t /*height*/,
+    const float k1,
+    const float k2,
+    const float k3,
+    const float k4,
+    mat2 &cov2d,
+    vec2 &mean2d)
+{
+    const float x = mean3d[0], y = mean3d[1], z = mean3d[2];
+    const float eps = 1e-7f;
+    const float xy_len = glm::length(glm::vec2({x, y})) + eps;
+    const float theta  = glm::atan(xy_len, z + eps);
+
+    const float t2 = theta * theta;
+    const float t4 = t2 * t2;
+    const float t6 = t4 * t2;
+    const float t8 = t4 * t4;
+    const float s        = 1.f + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8;
+    const float s_prime  = 2.f * k1 * theta + 4.f * k2 * theta * t2
+                         + 6.f * k3 * theta * t4 + 8.f * k4 * theta * t6;
+    const float phi        = theta * s;
+    const float phi_prime  = s + theta * s_prime;
+
+    mean2d = vec2({x * fx * phi / xy_len + cx, y * fy * phi / xy_len + cy});
+
+    const float x2         = x * x + eps;
+    const float y2         = y * y;
+    const float xy         = x * y;
+    const float x2y2       = x2 + y2;
+    const float x2y2z2_inv = 1.f / (x2y2 + z * z);
+
+    const float a = z * x2y2z2_inv / x2y2 * phi_prime;
+    const float b = theta / xy_len / x2y2 * s;
+    glm::mat3x2 J = glm::mat3x2(
+        fx * (x2 * a + y2 * b),
+        fy * xy * (a - b),
+        fx * xy * (a - b),
+        fy * (y2 * a + x2 * b),
+        -fx * x * x2y2z2_inv * phi_prime,
+        -fy * y * x2y2z2_inv * phi_prime
+    );
+    cov2d = J * cov3d * glm::transpose(J);
+}
+
 template<bool FUSE_SH, SHInputMode SH_MODE = SHInputMode::RAW_HALF>
 __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MIN_BLOCKS) projection_fwd_kernel(
     const uint32_t B,
@@ -58,6 +115,10 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
     const float far_plane,
     const float radius_clip,
     const CameraModelType camera_model,
+    const float k1,
+    const float k2,
+    const float k3,
+    const float k4,
     // outputs
     uint32_t *__restrict__ visible,    // [(B*C*N+31)/32] packed bitfield
     float *__restrict__ means2d,       // [B, C, N, 2]
@@ -113,7 +174,12 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         // transform Gaussian center to camera space
         vec3 mean_c;
         gsplat::posW2C(R, t, mean_w, mean_c);
-        if(mean_c.z < near_plane || mean_c.z > far_plane)
+        // For FISHEYE, use radial distance so back-hemisphere gaussians (z<0) at
+        // FoV > 180 pass; other models keep the pinhole-style z-depth semantics.
+        const float depth_val = (camera_model == CameraModelType::FISHEYE)
+            ? sqrtf(mean_c.x * mean_c.x + mean_c.y * mean_c.y + mean_c.z * mean_c.z)
+            : mean_c.z;
+        if(depth_val < near_plane || depth_val > far_plane)
         {
             return false;
         }
@@ -176,8 +242,9 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
             );
             break;
         case CameraModelType::FISHEYE:
-            gsplat::fisheye_proj(
-                mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5], image_width, image_height, covar2d, mean2d
+            fisheye_proj_distorted(
+                mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5], image_width, image_height,
+                k1, k2, k3, k4, covar2d, mean2d
             );
             break;
         }
@@ -227,7 +294,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
 
         // write to outputs
         AssignAs<float2>(means2d[idx * 2], mean2d);
-        depths[idx]       = mean_c.z;
+        depths[idx]       = depth_val;
         // Store Cholesky factor L of the inverse covariance: Sigma^{-1} = L*L^T,
         // L = [[l0, 0], [l1, l2]].  Consumers reconstruct A=l0², B=l0*l1,
         // C=l1²+l2² when needed.  This lets the rasterizer use the factors
@@ -295,6 +362,7 @@ void launch_projection_fwd_kernel(
     const float far_plane,
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs,
     // outputs
     at::Tensor visible,
     at::Tensor means2d,
@@ -327,6 +395,18 @@ void launch_projection_fwd_kernel(
         comp_ptr = compensations.value().data_ptr<float>();
     }
 
+    float k1 = 0.f, k2 = 0.f, k3 = 0.f, k4 = 0.f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "radial_coeffs must have at least 4 elements (k1..k4)");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0];
+        k2 = rc_ptr[1];
+        k3 = rc_ptr[2];
+        k4 = rc_ptr[3];
+    }
+
     projection_fwd_kernel<false><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         B,
         C,
@@ -343,6 +423,7 @@ void launch_projection_fwd_kernel(
         far_plane,
         radius_clip,
         camera_model,
+        k1, k2, k3, k4,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -385,7 +466,8 @@ void launch_projection_sh_fused_kernel(
     at::Tensor depths,
     at::Tensor conics,
     at::Tensor colors,
-    at::optional<at::Tensor> compensations
+    at::optional<at::Tensor> compensations,
+    const at::optional<at::Tensor> radial_coeffs
 )
 {
     uint32_t N = means.size(-1);
@@ -410,6 +492,18 @@ void launch_projection_sh_fused_kernel(
     if(compensations.has_value())
     {
         comp_ptr = compensations.value().data_ptr<float>();
+    }
+
+    float k1 = 0.f, k2 = 0.f, k3 = 0.f, k4 = 0.f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "radial_coeffs must have at least 4 elements (k1..k4)");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0];
+        k2 = rc_ptr[1];
+        k3 = rc_ptr[2];
+        k4 = rc_ptr[3];
     }
 
     const SHDecodeParams dp = decode_params ? *decode_params : SHDecodeParams{};
@@ -439,6 +533,7 @@ void launch_projection_sh_fused_kernel(
             far_plane,
             radius_clip,
             camera_model,
+            k1, k2, k3, k4,
             vis_ptr,
             means2d_ptr,
             depths_ptr,

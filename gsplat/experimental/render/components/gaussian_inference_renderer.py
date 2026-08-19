@@ -50,7 +50,6 @@ _RENDERER_UNSUPPORTED_KWARGS = frozenset(
         "return_normals",
         "covars",
         "rays",
-        "radial_coeffs",
         "tangential_coeffs",
         "thin_prism_coeffs",
         "ftheta_coeffs",
@@ -66,11 +65,21 @@ _RENDERER_UNSUPPORTED_KWARGS = frozenset(
         "ut_params",
         "colors",
         "render_mode",
-        "camera_model",
         "backgrounds",
         "sh_compression_mode",
     }
 )
+
+
+# Mapping from the public string API (matches vanilla `rasterization()`) to the
+# native CameraModelType enum ints exposed by the compiled backend.
+_CAMERA_MODEL_STR_TO_INT = {
+    "pinhole": 0,
+    "ortho": 1,
+    "fisheye": 2,
+    "ftheta": 3,
+    "lidar": 4,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +164,8 @@ class GaussianInferenceRenderer:
         eps2d: float = 0.3,
         background: Optional[Tensor] = None,
         sh_degree: Optional[int] = None,
+        camera_model: Optional[Any] = None,
+        radial_coeffs: Optional[Tensor] = None,
         out: Optional[RenderReturn] = None,
         **kwargs: Any,
     ) -> RenderReturn:
@@ -257,6 +268,42 @@ class GaussianInferenceRenderer:
             sh_degree if sh_degree is not None else self._scene.sh_degree
         )
 
+        # -- camera_model --------------------------------------------------
+        if camera_model is None:
+            camera_model_int = 0
+        elif isinstance(camera_model, str):
+            key = camera_model.lower()
+            if key not in _CAMERA_MODEL_STR_TO_INT:
+                raise ValueError(
+                    f"Unknown camera_model {camera_model!r}; expected one of "
+                    f"{sorted(_CAMERA_MODEL_STR_TO_INT)}"
+                )
+            camera_model_int = _CAMERA_MODEL_STR_TO_INT[key]
+        else:
+            camera_model_int = int(camera_model)
+
+        # -- radial_coeffs -------------------------------------------------
+        radial_coeffs_t: Optional[Tensor] = None
+        if radial_coeffs is not None:
+            if not isinstance(radial_coeffs, Tensor):
+                radial_coeffs_t = torch.as_tensor(
+                    radial_coeffs, dtype=torch.float32, device=scene_device
+                )
+            else:
+                radial_coeffs_t = radial_coeffs.to(
+                    dtype=torch.float32, device=scene_device
+                )
+            radial_coeffs_t = radial_coeffs_t.reshape(-1).contiguous()
+            if radial_coeffs_t.numel() < 4:
+                raise ValueError(
+                    f"radial_coeffs must have at least 4 elements (k1..k4); "
+                    f"got {radial_coeffs_t.numel()}"
+                )
+            if camera_model_int != _CAMERA_MODEL_STR_TO_INT["fisheye"]:
+                raise ValueError(
+                    "radial_coeffs only supported with camera_model='fisheye'"
+                )
+
         # -- Validate out buffer -------------------------------------------
         if out is not None:
             self._validate_half4_out_buffer(out, height, width, viewmat_t.device)
@@ -268,6 +315,8 @@ class GaussianInferenceRenderer:
             out_rgbt = self._get_frame_buffer(height, width, viewmat_t.device)
 
         # -- Call C++ renderer ---------------------------------------------
+        # camera_model / radial_coeffs are trailing kwargs with pybind defaults, so
+        # older callers (using only the first 16 positional args) keep working.
         rgbt = self._native.render(
             self._scene.means_planar,
             self._scene.qso_packed,
@@ -285,6 +334,8 @@ class GaussianInferenceRenderer:
             self._scene.sh_compression_mode,
             background,
             out_rgbt,
+            camera_model=camera_model_int,
+            radial_coeffs=radial_coeffs_t,
         )
 
         # -- Package result ------------------------------------------------

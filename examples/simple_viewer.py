@@ -210,6 +210,17 @@ def main(local_rank: int, world_rank, world_size: int, args):
         K = torch.from_numpy(K).float().to(device)
         viewmat = c2w.inverse().contiguous()
 
+        # Equidistant fisheye Ks override: image edge (min(W,H)/2) maps to theta=fov/2.
+        fisheye_override = args.fisheye_fov > 0
+        if fisheye_override:
+            fov_rad = math.radians(args.fisheye_fov)
+            f = min(width, height) / fov_rad
+            K = K.clone()
+            K[0, 0] = f
+            K[1, 1] = f
+            K[0, 2] = width / 2.0
+            K[1, 2] = height / 2.0
+
         if args.use_gaussian_render_inference_scene:
             bg_raw = render_tab_state.backgrounds
             bg = torch.tensor(bg_raw, device=device) / 255.0
@@ -223,7 +234,14 @@ def main(local_rank: int, world_rank, world_size: int, args):
                 radius_clip=render_tab_state.radius_clip,
                 eps2d=render_tab_state.eps2d,
                 background=bg,
+                camera_model=(
+                    "fisheye" if fisheye_override else render_tab_state.camera_model
+                ),
             )
+            if fisheye_override and args.fisheye_radial_coeffs is not None:
+                render_kwargs["radial_coeffs"] = torch.tensor(
+                    args.fisheye_radial_coeffs, dtype=torch.float32, device=device
+                )
         else:
             RENDER_MODE_MAP = {
                 "rgb": "RGB",
@@ -250,16 +268,19 @@ def main(local_rank: int, world_rank, world_size: int, args):
                 / 255.0,
                 render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
                 rasterize_mode=render_tab_state.rasterize_mode,
-                camera_model=render_tab_state.camera_model,
+                camera_model=(
+                    "fisheye" if fisheye_override else render_tab_state.camera_model
+                ),
                 packed=False,
                 with_ut=args.with_ut,
                 with_eval3d=args.with_eval3d,
             )
-
         with torch.inference_mode():
             if args.use_gaussian_render_inference_scene:
+                # print("Rendering with GaussianInferenceRenderer...")
                 ret = inference_renderer.render(**render_kwargs)
             else:
+                # print("Rendering with rasterization...")
                 render_colors_out, render_alphas_out, render_info = rasterization(
                     splats["means"],
                     splats["quats"],
@@ -319,6 +340,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
         mode="rendering",
     )
     if args.use_gaussian_render_inference_scene:
+        # print("Using Inference (non-differentiable) Gaussian renderer for viewer.")
         viewer_kwargs["render_modes"] = ("rgb",)
     _ = GsplatViewer(**viewer_kwargs)
     print("Viewer running... Ctrl+C to exit.")
@@ -360,7 +382,29 @@ if __name__ == "__main__":
         action="store_true",
         help="use the Inference (non-differentiable) rasterization path",
     )
+    parser.add_argument(
+        "--fisheye_fov",
+        type=float,
+        default=0.0,
+        help="total FoV in degrees for equidistant fisheye; 0 disables",
+    )
+    parser.add_argument(
+        "--fisheye_radial_coeffs",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("k1", "k2", "k3", "k4"),
+        help="OpenCV fisheye radial distortion coefficients k1..k4 (Inference path only)",
+    )
     args = parser.parse_args()
     assert args.scene_grid % 2 == 1, "scene_grid must be odd"
+    if (
+        args.fisheye_radial_coeffs is not None
+        and not args.use_gaussian_render_inference_scene
+    ):
+        print(
+            "[warn] --fisheye_radial_coeffs ignored: distortion coefficients are only "
+            "wired into the Inference path; add --use_gaussian_render_inference_scene."
+        )
 
     cli(main, args, verbose=True)

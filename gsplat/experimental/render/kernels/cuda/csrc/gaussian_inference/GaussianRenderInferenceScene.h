@@ -116,7 +116,9 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        int64_t camera_model = 0,
+        const at::optional<at::Tensor> &radial_coeffs = at::nullopt
     );
 
     // ---------------------------------------------------------------------------
@@ -160,7 +162,9 @@ namespace gaussian_render_inference_scene
             int64_t sh_degree,
             int64_t sh_compression_mode,
             const at::optional<at::Tensor> &background,
-            const at::optional<at::Tensor> &out_rgbt
+            const at::optional<at::Tensor> &out_rgbt,
+            int64_t camera_model = 0,
+            const at::optional<at::Tensor> &radial_coeffs = at::nullopt
         );
 
         /// Release all GPU resources.
