@@ -1,6 +1,21 @@
 @echo off
 setlocal
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+rem Locate vcvarsall.bat dynamically via vswhere (works for Community/Professional/Enterprise/BuildTools)
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+    echo ERROR: vswhere.exe not found. Install Visual Studio or Build Tools first.
+    exit /b 1
+)
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualCpp.Tools.HostX64.TargetX64 -property installationPath`) do set "VS_INSTALL=%%i"
+if not defined VS_INSTALL (
+    echo ERROR: No Visual Studio installation with MSVC x64 tools found.
+    exit /b 1
+)
+set "VCVARSALL=%VS_INSTALL%\VC\Auxiliary\Build\vcvarsall.bat"
+echo Using MSVC: "%VCVARSALL%"
+call "%VCVARSALL%" x64
 set "DISTUTILS_USE_SDK=1"
 set "CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
