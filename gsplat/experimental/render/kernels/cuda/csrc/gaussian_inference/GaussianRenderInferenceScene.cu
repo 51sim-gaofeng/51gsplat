@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 #include "Common.h" // CHECK_INPUT, DEVICE_GUARD, CameraModelType
@@ -69,9 +70,7 @@ namespace gaussian_render_inference_scene
             return state;
         }
 
-        auto opts_f = at::TensorOptions().dtype(at::kFloat).device(scene.means_planar.device());
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
-        auto opts_i = at::TensorOptions().dtype(at::kInt).device(scene.means_planar.device());
 
         // ---- Determine K from shape ----
         if(scene.sh_degree >= 0 && scene.colors_packed.dim() == 3)
@@ -111,14 +110,6 @@ namespace gaussian_render_inference_scene
             torch::cuda::synchronize();
         }
 
-        // ---- Pre-allocate per-frame intermediates ----
-        int64_t num_gaussians = static_cast<int64_t>(state->num_gaussians);
-        state->visible        = at::zeros({(num_gaussians + 31) / 32}, opts_i);
-        state->means2d        = at::empty({1, 1, num_gaussians, 2}, opts_f);
-        state->depths         = at::empty({1, 1, num_gaussians}, opts_f);
-        state->conics         = at::empty({1, 1, num_gaussians, 4}, opts_h);
-        state->colors         = at::zeros({num_gaussians, 4}, opts_h);
-
         // ---- Pre-allocate default black background: [R, G, B, T] ----
         state->background = at::zeros({1, 4}, opts_h);
         state->background.select(1, 3).fill_(at::Half(1.0f));
@@ -127,6 +118,40 @@ namespace gaussian_render_inference_scene
         state->isect = std::make_unique<IntersectMTFused>();
 
         return state;
+    }
+
+    static void ensure_render_capacity(
+        InferenceRenderState &state,
+        int64_t requested,
+        const at::Device &device
+    )
+    {
+        if(requested <= static_cast<int64_t>(state.buffer_capacity))
+        {
+            return;
+        }
+
+        uint64_t capacity = 1;
+        while(capacity < static_cast<uint64_t>(requested))
+        {
+            capacity <<= 1;
+        }
+        capacity = std::min<uint64_t>(capacity, state.num_gaussians);
+        TORCH_CHECK(
+            capacity <= std::numeric_limits<uint32_t>::max(),
+            "render buffer capacity exceeds uint32 range"
+        );
+
+        auto opts_f = at::TensorOptions().dtype(at::kFloat).device(device);
+        auto opts_h = at::TensorOptions().dtype(at::kHalf).device(device);
+        auto opts_i = at::TensorOptions().dtype(at::kInt).device(device);
+        const int64_t count = static_cast<int64_t>(capacity);
+        state.visible       = at::zeros({(count + 31) / 32}, opts_i);
+        state.means2d       = at::empty({1, 1, count, 2}, opts_f);
+        state.depths        = at::empty({1, 1, count}, opts_f);
+        state.conics        = at::empty({1, 1, count, 4}, opts_h);
+        state.colors        = at::empty({count, 4}, opts_h);
+        state.buffer_capacity = static_cast<uint32_t>(capacity);
     }
 
     // ==========================================================================
@@ -156,14 +181,17 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        int64_t camera_model,
+        const at::optional<at::Tensor> &radial_coeffs,
+        const at::optional<at::Tensor> &active_indices,
+        double fisheye_max_theta
     )
     {
         // NOTE: No c10::NoGradGuard here -- the Python caller already enforces
         // torch.inference_mode() (via check_inference_grad_mode), so adding a
         // redundant guard would cost ~2 us per frame in thread-local toggles.
         DEVICE_GUARD(scene.means_planar);
-
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
 
         // ---- Validate out_rgbt if provided ----
@@ -192,8 +220,34 @@ namespace gaussian_render_inference_scene
             );
         }
 
-        // ---- Early return for empty scene ----
-        if(state.num_gaussians == 0)
+        const int64_t active_count
+            = active_indices.has_value() ? active_indices.value().numel() : static_cast<int64_t>(state.num_gaussians);
+        if(active_indices.has_value())
+        {
+            const auto &indices = active_indices.value();
+            TORCH_CHECK(indices.is_cuda(), "active_indices must be a CUDA tensor");
+            TORCH_CHECK(
+                indices.device() == scene.means_planar.device(),
+                "active_indices must be on the same CUDA device as the scene"
+            );
+            TORCH_CHECK(
+                indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong,
+                "active_indices must be int32 or int64"
+            );
+            TORCH_CHECK(indices.dim() == 1, "active_indices must be one-dimensional");
+            TORCH_CHECK(indices.is_contiguous(), "active_indices must be contiguous");
+            TORCH_CHECK(
+                active_count <= static_cast<int64_t>(state.num_gaussians),
+                "active_indices length (",
+                active_count,
+                ") exceeds scene capacity (",
+                state.num_gaussians,
+                ")"
+            );
+        }
+
+        // ---- Early return for an empty scene or active set ----
+        if(state.num_gaussians == 0 || active_count == 0)
         {
             at::Tensor rgbt = out_rgbt.has_value() ? out_rgbt.value() : at::zeros({1, height, width, 4}, opts_h);
             rgbt.zero_();
@@ -204,6 +258,11 @@ namespace gaussian_render_inference_scene
             }
             return rgbt;
         }
+        ensure_render_capacity(
+            state,
+            active_count,
+            scene.means_planar.device()
+        );
 
         // ---- Tile grid dimensions ----
         uint32_t tw
@@ -262,6 +321,12 @@ namespace gaussian_render_inference_scene
         const auto &qso_packed          = scene.qso_packed;
         const auto &colors_packed       = scene.colors_packed;
         const at::Tensor *raster_colors = &state.colors;
+        const int64_t visible_words     = (active_count + 31) / 32;
+        auto active_visible             = state.visible.narrow(0, 0, visible_words);
+        auto active_means2d             = state.means2d.narrow(2, 0, active_count);
+        auto active_depths              = state.depths.narrow(2, 0, active_count);
+        auto active_conics              = state.conics.narrow(2, 0, active_count);
+        auto active_colors              = state.colors.narrow(0, 0, active_count);
 
         if(state.sh_coeffs_per_channel > 0 && compression != SHCompressionMode::NONE)
         {
@@ -285,19 +350,22 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(near_plane),
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
+                static_cast<gsplat::CameraModelType>(camera_model),
                 static_cast<int32_t>(sh_degree),
                 state.shCompressed,
                 SH_ACTIVATION_SCALE,
                 SH_ACTIVATION_SHIFT,
                 compression,
                 decode_params,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                state.colors,
-                {}
+                active_indices,
+                active_visible,
+                active_means2d,
+                active_depths,
+                active_conics,
+                active_colors,
+                {},
+                radial_coeffs,
+                static_cast<float>(fisheye_max_theta)
             );
         }
         else if(state.sh_coeffs_per_channel == 16)
@@ -315,90 +383,163 @@ namespace gaussian_render_inference_scene
                 static_cast<float>(near_plane),
                 static_cast<float>(far_plane),
                 static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
+                static_cast<gsplat::CameraModelType>(camera_model),
                 static_cast<int32_t>(sh_degree),
                 colors_packed,
                 SH_ACTIVATION_SCALE,
                 SH_ACTIVATION_SHIFT,
                 SHCompressionMode::NONE,
                 nullptr,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                state.colors,
-                {}
+                active_indices,
+                active_visible,
+                active_means2d,
+                active_depths,
+                active_conics,
+                active_colors,
+                {},
+                radial_coeffs,
+                static_cast<float>(fisheye_max_theta)
             );
         }
         else if(state.sh_coeffs_per_channel > 0)
         {
             // ---- Generic lower-degree SH (K != 16): projection first, then float32 SH ----
-            higs::launch_projection_fwd_kernel(
-                means,
-                {},
-                qso_packed,
-                viewmat_4d,
-                K_4d,
-                static_cast<uint32_t>(width),
-                static_cast<uint32_t>(height),
-                static_cast<float>(eps2d),
-                static_cast<float>(near_plane),
-                static_cast<float>(far_plane),
-                static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                {}
-            );
-
-            higs::launch_spherical_harmonics_viewmat_fwd_kernel(
-                static_cast<int32_t>(sh_degree),
-                means,
-                viewmat,
-                colors_packed,
-                state.visible,
-                SH_ACTIVATION_SCALE,
-                SH_ACTIVATION_SHIFT,
-                state.colors
-            );
+            if(active_indices.has_value())
+            {
+                higs::launch_projection_indexed_kernel(
+                    means,
+                    qso_packed,
+                    {},
+                    active_indices.value(),
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    static_cast<gsplat::CameraModelType>(camera_model),
+                    radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    {}
+                );
+                higs::launch_spherical_harmonics_viewmat_indexed_fwd_kernel(
+                    static_cast<int32_t>(sh_degree),
+                    means,
+                    viewmat,
+                    colors_packed,
+                    active_indices.value(),
+                    active_visible,
+                    SH_ACTIVATION_SCALE,
+                    SH_ACTIVATION_SHIFT,
+                    active_colors
+                );
+            }
+            else
+            {
+                higs::launch_projection_fwd_kernel(
+                    means,
+                    {},
+                    qso_packed,
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    static_cast<gsplat::CameraModelType>(camera_model),
+                    radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    {}
+                );
+                higs::launch_spherical_harmonics_viewmat_fwd_kernel(
+                    static_cast<int32_t>(sh_degree),
+                    means,
+                    viewmat,
+                    colors_packed,
+                    active_visible,
+                    SH_ACTIVATION_SCALE,
+                    SH_ACTIVATION_SHIFT,
+                    active_colors
+                );
+            }
         }
         else
         {
             // ---- Pre-activated RGB: projection only + copy colors ----
-            higs::launch_projection_fwd_kernel(
-                means,
-                {},
-                qso_packed,
-                viewmat_4d,
-                K_4d,
-                static_cast<uint32_t>(width),
-                static_cast<uint32_t>(height),
-                static_cast<float>(eps2d),
-                static_cast<float>(near_plane),
-                static_cast<float>(far_plane),
-                static_cast<float>(radius_clip),
-                gsplat::CameraModelType::PINHOLE,
-                state.visible,
-                state.means2d,
-                state.depths,
-                state.conics,
-                {}
-            );
-
-            // colors_packed is already [N, 4] half {R, G, B, 0}
-            raster_colors = &colors_packed;
+            if(active_indices.has_value())
+            {
+                higs::launch_projection_indexed_kernel(
+                    means,
+                    qso_packed,
+                    colors_packed,
+                    active_indices.value(),
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    static_cast<gsplat::CameraModelType>(camera_model),
+                    radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    active_colors
+                );
+                raster_colors = &active_colors;
+            }
+            else
+            {
+                higs::launch_projection_fwd_kernel(
+                    means,
+                    {},
+                    qso_packed,
+                    viewmat_4d,
+                    K_4d,
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    static_cast<float>(eps2d),
+                    static_cast<float>(near_plane),
+                    static_cast<float>(far_plane),
+                    static_cast<float>(radius_clip),
+                    static_cast<gsplat::CameraModelType>(camera_model),
+                    radial_coeffs,
+                    static_cast<float>(fisheye_max_theta),
+                    active_visible,
+                    active_means2d,
+                    active_depths,
+                    active_conics,
+                    {}
+                );
+                // colors_packed is already [N, 4] half {R, G, B, 0}
+                raster_colors = &colors_packed;
+            }
         }
 
         // ==================================================================
         // Intersection + Rasterization (fused macro-tile path)
         // ==================================================================
         state.isect->execute(
-            state.means2d,
-            state.depths,
-            state.conics,
-            state.visible,
+            active_means2d,
+            active_depths,
+            active_conics,
+            active_visible,
             static_cast<int32_t>(tile_size),
             static_cast<int32_t>(tw),
             static_cast<int32_t>(th),
@@ -406,8 +547,8 @@ namespace gaussian_render_inference_scene
         );
 
         state.isect->rasterize(
-            state.means2d,
-            state.conics,
+            active_means2d,
+            active_conics,
             *raster_colors,
             state.background,
             static_cast<uint32_t>(width),
@@ -474,7 +615,11 @@ namespace gaussian_render_inference_scene
         int64_t sh_degree,
         int64_t sh_compression_mode,
         const at::optional<at::Tensor> &background,
-        const at::optional<at::Tensor> &out_rgbt
+        const at::optional<at::Tensor> &out_rgbt,
+        int64_t camera_model,
+        const at::optional<at::Tensor> &radial_coeffs,
+        const at::optional<at::Tensor> &active_indices,
+        double fisheye_max_theta
     )
     {
         // Use the colors tensor normalized once at construction time (colors_normalized_)
@@ -502,7 +647,11 @@ namespace gaussian_render_inference_scene
             sh_degree,
             sh_compression_mode,
             background,
-            out_rgbt
+            out_rgbt,
+            camera_model,
+            radial_coeffs,
+            active_indices,
+            fisheye_max_theta
         );
     }
 
@@ -645,6 +794,7 @@ namespace gaussian_render_inference_scene
         auto state = create_gaussian_render_inference_scene_state(scene, sh_compression_mode);
 
         // ---- Render via render_gaussian_inference_scene ----
+        // Compat wrapper preserves original pinhole-only, no-distortion semantics.
         at::Tensor rgbt = render_gaussian_inference_scene(
             *state,
             scene,
@@ -660,7 +810,11 @@ namespace gaussian_render_inference_scene
             sh_degree,
             sh_compression_mode,
             background,
-            at::nullopt
+            at::nullopt,
+            static_cast<int64_t>(gsplat::CameraModelType::PINHOLE),
+            at::nullopt,
+            at::nullopt,
+            0.0
         );
 
         // ---- Extract RGB and alpha from RGBT output ----

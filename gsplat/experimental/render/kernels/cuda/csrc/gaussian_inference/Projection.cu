@@ -41,14 +41,75 @@ using gsplat::vec2;
 using gsplat::vec3;
 using gsplat::vec4;
 
+// OpenCV fisheye (4-coefficient) distortion applied on top of equidistant fisheye_proj.
+// theta_d = theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8), t = theta.
+// Covariance uses chain-rule scaling of the fisheye Jacobian: direct-theta terms scale
+// by s = theta_d/theta; d(theta)/d(x,y,z) terms scale by phi' = d(theta_d)/d(theta).
+// With k1..k4 == 0 this reduces exactly to gsplat::fisheye_proj.
+inline __device__ void fisheye_proj_distorted(
+    const vec3 mean3d,
+    const mat3 cov3d,
+    const float fx,
+    const float fy,
+    const float cx,
+    const float cy,
+    const uint32_t /*width*/,
+    const uint32_t /*height*/,
+    const float k1,
+    const float k2,
+    const float k3,
+    const float k4,
+    mat2 &cov2d,
+    vec2 &mean2d)
+{
+    const float x = mean3d[0], y = mean3d[1], z = mean3d[2];
+    const float eps = 1e-7f;
+    const float xy_len = glm::length(glm::vec2({x, y})) + eps;
+    const float theta  = glm::atan(xy_len, z + eps);
+
+    const float t2 = theta * theta;
+    const float t4 = t2 * t2;
+    const float t6 = t4 * t2;
+    const float t8 = t4 * t4;
+    const float s        = 1.f + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8;
+    const float s_prime  = 2.f * k1 * theta + 4.f * k2 * theta * t2
+                         + 6.f * k3 * theta * t4 + 8.f * k4 * theta * t6;
+    const float phi        = theta * s;
+    const float phi_prime  = s + theta * s_prime;
+
+    mean2d = vec2({x * fx * phi / xy_len + cx, y * fy * phi / xy_len + cy});
+
+    const float x2         = x * x + eps;
+    const float y2         = y * y;
+    const float xy         = x * y;
+    const float x2y2       = x2 + y2;
+    const float x2y2z2_inv = 1.f / (x2y2 + z * z);
+
+    const float a = z * x2y2z2_inv / x2y2 * phi_prime;
+    const float b = theta / xy_len / x2y2 * s;
+    glm::mat3x2 J = glm::mat3x2(
+        fx * (x2 * a + y2 * b),
+        fy * xy * (a - b),
+        fx * xy * (a - b),
+        fy * (y2 * a + x2 * b),
+        -fx * x * x2y2z2_inv * phi_prime,
+        -fy * y * x2y2z2_inv * phi_prime
+    );
+    cov2d = J * cov3d * glm::transpose(J);
+}
+
 template<bool FUSE_SH, SHInputMode SH_MODE = SHInputMode::RAW_HALF>
 __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MIN_BLOCKS) projection_fwd_kernel(
     const uint32_t B,
     const uint32_t C,
     const uint32_t N,
+    const uint32_t source_N,
     const float *__restrict__ means,      // [B, 3, N]
     const float *__restrict__ covars,     // [B, N, 6] optional
     const __half *__restrict__ inference, // [B, N, 8] half — packed {quat(4), scale(3), opacity(1)}
+    const void *__restrict__ active_indices,
+    const bool active_indices_int64,
+    const __half *__restrict__ source_colors,
     const float *__restrict__ viewmats,   // [B, C, 4, 4]
     const float *__restrict__ Ks,         // [B, C, 3, 3]
     const uint32_t image_width,
@@ -58,6 +119,11 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
     const float far_plane,
     const float radius_clip,
     const CameraModelType camera_model,
+    const float k1,
+    const float k2,
+    const float k3,
+    const float k4,
+    const float fisheye_max_theta,
     // outputs
     uint32_t *__restrict__ visible,    // [(B*C*N+31)/32] packed bitfield
     float *__restrict__ means2d,       // [B, C, N, 2]
@@ -87,14 +153,30 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         const int32_t bid = idx / (C * N); // batch id
         const int32_t cid = (idx / N) % C; // camera id
         const int32_t gid = idx % N;       // gaussian id
+        const int64_t source_idx
+            = active_indices == nullptr
+                ? gid
+                : (active_indices_int64 ? reinterpret_cast<const int64_t *>(active_indices)[gid]
+                                        : reinterpret_cast<const int32_t *>(active_indices)[gid]);
+        if(source_idx < 0 || source_idx >= source_N)
+        {
+            return false;
+        }
+        const int32_t source_gid = static_cast<int32_t>(source_idx);
 
         // shift pointers to the current camera and gaussian
-        const float *means_b    = means + bid * 3 * N;
+        const float *means_b    = means + bid * 3 * source_N;
         const float *viewmats_b = viewmats + bid * C * 16 + cid * 16;
         const float *Ks_b       = Ks + bid * C * 9 + cid * 9;
 
         // planar [B, 3, N] layout: coalesced reads across threads
-        const vec3 mean_w = vec3(means_b[gid], means_b[N + gid], means_b[2 * N + gid]);
+        const vec3 mean_w
+            = vec3(means_b[source_gid], means_b[source_N + source_gid], means_b[2 * source_N + source_gid]);
+
+        if(source_colors != nullptr)
+        {
+            AssignAs<uint2>(colors[gid * 4], source_colors[source_gid * 4]);
+        }
 
         // glm is column-major but input is row-major
         const mat3 R = mat3(
@@ -113,14 +195,19 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         // transform Gaussian center to camera space
         vec3 mean_c;
         gsplat::posW2C(R, t, mean_w, mean_c);
-        if(mean_c.z < near_plane || mean_c.z > far_plane)
+        // For FISHEYE, use radial distance so back-hemisphere gaussians (z<0) at
+        // FoV > 180 pass; other models keep the pinhole-style z-depth semantics.
+        const float depth_val = (camera_model == CameraModelType::FISHEYE)
+            ? sqrtf(mean_c.x * mean_c.x + mean_c.y * mean_c.y + mean_c.z * mean_c.z)
+            : mean_c.z;
+        if(depth_val < near_plane || depth_val > far_plane)
         {
             return false;
         }
 
         // Wide 128-bit load of packed {quat(4), scale(3), opacity(1)} in half
         __half inference_local[8];
-        AssignAs<uint4>(inference_local[0], inference[(bid * N + gid) * 8]);
+        AssignAs<uint4>(inference_local[0], inference[(bid * source_N + source_gid) * 8]);
 
         const vec4 quat = vec4(
             __half2float(inference_local[0]),
@@ -133,11 +220,29 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         );
         float opacity = __half2float(inference_local[7]);
 
+        // Fisheye field-angle cull + soft fade: past the calibrated FoV the
+        // OpenCV coeffs extrapolate and EWA covariance explodes into radial
+        // streaks. Cull beyond fisheye_max_theta; fade opacity over the last ~6deg.
+        if(camera_model == CameraModelType::FISHEYE && fisheye_max_theta > 0.f)
+        {
+            const float rho   = sqrtf(mean_c.x * mean_c.x + mean_c.y * mean_c.y);
+            const float theta = atan2f(rho, mean_c.z);
+            if(theta >= fisheye_max_theta)
+            {
+                return false;
+            }
+            const float band = 0.10471975512f; // ~6 deg fade
+            if(theta > fisheye_max_theta - band)
+            {
+                opacity *= (fisheye_max_theta - theta) / band;
+            }
+        }
+
         // transform Gaussian covariance to camera space
         mat3 covar;
         if(covars != nullptr)
         {
-            const float *covars_g = covars + bid * N * 6 + gid * 6;
+            const float *covars_g = covars + bid * source_N * 6 + source_gid * 6;
 
             covar = mat3(
                 covars_g[0],
@@ -176,8 +281,9 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
             );
             break;
         case CameraModelType::FISHEYE:
-            gsplat::fisheye_proj(
-                mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5], image_width, image_height, covar2d, mean2d
+            fisheye_proj_distorted(
+                mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5], image_width, image_height,
+                k1, k2, k3, k4, covar2d, mean2d
             );
             break;
         }
@@ -227,7 +333,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
 
         // write to outputs
         AssignAs<float2>(means2d[idx * 2], mean2d);
-        depths[idx]       = mean_c.z;
+        depths[idx]       = depth_val;
         // Store Cholesky factor L of the inverse covariance: Sigma^{-1} = L*L^T,
         // L = [[l0, 0], [l1, l2]].  Consumers reconstruct A=l0², B=l0*l1,
         // C=l1²+l2² when needed.  This lets the rasterizer use the factors
@@ -260,7 +366,16 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
             const float inorm  = rsqrtf(dx * dx + dy * dy + dz * dz);
             const float3 dir_n = make_float3(dx * inorm, dy * inorm, dz * inorm);
             EvalSHForGaussian<SH_MODE>(
-                dir_n, gid, N, degrees_to_use, sh_input, sh_bias, sh_min_value, sh_decode_params, colors
+                dir_n,
+                source_gid,
+                source_N,
+                gid,
+                degrees_to_use,
+                sh_input,
+                sh_bias,
+                sh_min_value,
+                sh_decode_params,
+                colors
             );
         }
 
@@ -295,6 +410,8 @@ void launch_projection_fwd_kernel(
     const float far_plane,
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs,
+    const float fisheye_max_theta,
     // outputs
     at::Tensor visible,
     at::Tensor means2d,
@@ -327,13 +444,29 @@ void launch_projection_fwd_kernel(
         comp_ptr = compensations.value().data_ptr<float>();
     }
 
+    float k1 = 0.f, k2 = 0.f, k3 = 0.f, k4 = 0.f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "radial_coeffs must have at least 4 elements (k1..k4)");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0];
+        k2 = rc_ptr[1];
+        k3 = rc_ptr[2];
+        k4 = rc_ptr[3];
+    }
+
     projection_fwd_kernel<false><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         B,
         C,
         N,
+        N,
         means.data_ptr<float>(),
         covars_ptr,
         reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
+        nullptr,
+        false,
+        nullptr,
         viewmats.data_ptr<float>(),
         Ks.data_ptr<float>(),
         image_width,
@@ -343,6 +476,8 @@ void launch_projection_fwd_kernel(
         far_plane,
         radius_clip,
         camera_model,
+        k1, k2, k3, k4,
+        fisheye_max_theta,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -355,6 +490,89 @@ void launch_projection_fwd_kernel(
         0.f,
         SHDecodeParams{},
         nullptr
+    );
+}
+
+void launch_projection_indexed_kernel(
+    const at::Tensor means,
+    const at::Tensor inference,
+    const at::optional<at::Tensor> colors,
+    const at::Tensor active_indices,
+    const at::Tensor viewmats,
+    const at::Tensor Ks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float eps2d,
+    const float near_plane,
+    const float far_plane,
+    const float radius_clip,
+    const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs,
+    const float fisheye_max_theta,
+    at::Tensor visible,
+    at::Tensor means2d,
+    at::Tensor depths,
+    at::Tensor conics,
+    const at::optional<at::Tensor> &out_colors
+)
+{
+    const uint32_t source_N = means.size(-1);
+    const uint32_t N        = active_indices.numel();
+    const uint32_t C        = viewmats.size(-3);
+    const uint32_t B        = means.numel() / (3 * source_N);
+    const int64_t n_elements = static_cast<int64_t>(B) * C * N;
+    if(n_elements == 0)
+    {
+        return;
+    }
+
+    float k1 = 0.f, k2 = 0.f, k3 = 0.f, k4 = 0.f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "radial_coeffs must have at least 4 elements (k1..k4)");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0];
+        k2 = rc_ptr[1];
+        k3 = rc_ptr[2];
+        k4 = rc_ptr[3];
+    }
+
+    dim3 threads(CTA_SIZE);
+    dim3 grid((n_elements + threads.x - 1) / threads.x);
+    projection_fwd_kernel<false><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        B,
+        C,
+        N,
+        source_N,
+        means.data_ptr<float>(),
+        nullptr,
+        reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
+        active_indices.data_ptr(),
+        active_indices.scalar_type() == at::kLong,
+        colors.has_value() ? reinterpret_cast<const __half *>(colors.value().data_ptr<at::Half>()) : nullptr,
+        viewmats.data_ptr<float>(),
+        Ks.data_ptr<float>(),
+        image_width,
+        image_height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        camera_model,
+        k1, k2, k3, k4,
+        fisheye_max_theta,
+        reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
+        means2d.data_ptr<float>(),
+        depths.data_ptr<float>(),
+        reinterpret_cast<__half *>(conics.data_ptr<at::Half>()),
+        nullptr,
+        0,
+        nullptr,
+        0.f,
+        0.f,
+        SHDecodeParams{},
+        out_colors.has_value() ? reinterpret_cast<__half *>(out_colors.value().data_ptr<at::Half>()) : nullptr
     );
 }
 
@@ -379,18 +597,22 @@ void launch_projection_sh_fused_kernel(
     const float min_value,
     const SHCompressionMode mode,
     const SHDecodeParams *decode_params,
+    const at::optional<at::Tensor> &active_indices,
     // outputs
     at::Tensor visible,
     at::Tensor means2d,
     at::Tensor depths,
     at::Tensor conics,
     at::Tensor colors,
-    at::optional<at::Tensor> compensations
+    at::optional<at::Tensor> compensations,
+    const at::optional<at::Tensor> radial_coeffs,
+    const float fisheye_max_theta
 )
 {
-    uint32_t N = means.size(-1);
+    uint32_t source_N = means.size(-1);
+    uint32_t N = active_indices.has_value() ? active_indices.value().numel() : source_N;
     uint32_t C = viewmats.size(-3);
-    uint32_t B = means.numel() / (3 * N);
+    uint32_t B = means.numel() / (3 * source_N);
 
     int64_t n_elements = B * C * N;
     dim3 threads(CTA_SIZE);
@@ -412,6 +634,18 @@ void launch_projection_sh_fused_kernel(
         comp_ptr = compensations.value().data_ptr<float>();
     }
 
+    float k1 = 0.f, k2 = 0.f, k3 = 0.f, k4 = 0.f;
+    if(radial_coeffs.has_value())
+    {
+        const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+        TORCH_CHECK(rc.numel() >= 4, "radial_coeffs must have at least 4 elements (k1..k4)");
+        const float *rc_ptr = rc.data_ptr<float>();
+        k1 = rc_ptr[0];
+        k2 = rc_ptr[1];
+        k3 = rc_ptr[2];
+        k4 = rc_ptr[3];
+    }
+
     const SHDecodeParams dp = decode_params ? *decode_params : SHDecodeParams{};
     auto stream             = at::cuda::getCurrentCUDAStream();
     auto *vis_ptr           = reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>());
@@ -427,9 +661,13 @@ void launch_projection_sh_fused_kernel(
             B,
             C,
             N,
+            source_N,
             means.data_ptr<float>(),
             covars_ptr,
             reinterpret_cast<const __half *>(inference.data_ptr<at::Half>()),
+            active_indices.has_value() ? active_indices.value().data_ptr() : nullptr,
+            active_indices.has_value() && active_indices.value().scalar_type() == at::kLong,
+            nullptr,
             viewmats.data_ptr<float>(),
             Ks.data_ptr<float>(),
             image_width,
@@ -439,6 +677,8 @@ void launch_projection_sh_fused_kernel(
             far_plane,
             radius_clip,
             camera_model,
+            k1, k2, k3, k4,
+            fisheye_max_theta,
             vis_ptr,
             means2d_ptr,
             depths_ptr,
