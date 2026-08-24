@@ -44,12 +44,41 @@ void launch_projection_fwd_kernel(
     const float far_plane,
     const float radius_clip,
     const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
+    const float fisheye_max_theta,         // >0: cull splats past this cam-space angle (rad); 0=off
     // outputs
     at::Tensor visible,                    // [(N+31)/32] int32 packed bitfield
     at::Tensor means2d,                    // [1, 1, N, 2]
     at::Tensor depths,                     // [1, 1, N]
     at::Tensor conics,                     // [1, 1, N, 4] half {l0,l1,l2,opacity}
     at::optional<at::Tensor> compensations // [1, 1, N] optional
+);
+
+// Projection-only launch over a compact active set. Source attributes are read
+// through active_indices while all outputs use compact active-slot indexing.
+void launch_projection_indexed_kernel(
+    // source pool inputs
+    const at::Tensor means,          // [3, source_N]
+    const at::Tensor inference,      // [source_N, 8] half
+    const at::optional<at::Tensor> colors, // [source_N, 4] half, optional
+    const at::Tensor active_indices, // [active_N] int32/int64
+    const at::Tensor viewmats,       // [1, 1, 4, 4]
+    const at::Tensor Ks,             // [1, 1, 3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float eps2d,
+    const float near_plane,
+    const float far_plane,
+    const float radius_clip,
+    const gsplat::CameraModelType camera_model,
+    const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
+    const float fisheye_max_theta, // >0: cull splats past this cam-space angle (rad); 0=off
+    // compact active-slot outputs
+    at::Tensor visible, // [(active_N+31)/32] int32 packed bitfield
+    at::Tensor means2d, // [1, 1, active_N, 2]
+    at::Tensor depths,  // [1, 1, active_N]
+    at::Tensor conics,  // [1, 1, active_N, 4] half
+    const at::optional<at::Tensor> &out_colors // [active_N, 4] half, optional
 );
 
 // Fused projection + SH evaluation launch (FUSE_SH=true).
@@ -75,12 +104,15 @@ void launch_projection_sh_fused_kernel(
     const float min_value,
     const SHCompressionMode mode,
     const SHDecodeParams *decode_params,
+    const at::optional<at::Tensor> &active_indices,
     // outputs
     at::Tensor visible,                    // [(N+31)/32] int32 packed bitfield
     at::Tensor means2d,                    // [1, 1, N, 2]
     at::Tensor depths,                     // [1, 1, N]
     at::Tensor conics,                     // [1, 1, N, 4] half
     at::Tensor colors,                     // [N, 4] half {R,G,B,0}
-    at::optional<at::Tensor> compensations // [1, 1, N] optional
+    at::optional<at::Tensor> compensations, // [1, 1, N] optional
+    const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
+    const float fisheye_max_theta // >0: cull splats past this cam-space angle (rad); 0=off
 );
 } // namespace higs

@@ -56,4 +56,16 @@ void launch_spherical_harmonics_viewmat_fwd_kernel(
     // outputs
     at::Tensor colors // [N, 4] half {R,G,B,0}
 );
+
+void launch_spherical_harmonics_viewmat_indexed_fwd_kernel(
+    int32_t degrees_to_use,
+    const at::Tensor means,          // [3, source_N] float
+    const at::Tensor viewmat,        // [4, 4] float row-major
+    const at::Tensor coeffs,         // [source_N, K, 3] float
+    const at::Tensor active_indices, // [active_N] int32/int64
+    const at::Tensor masks,          // [(active_N+31)/32]
+    float bias,
+    float min_value,
+    at::Tensor colors // [active_N, 4] half
+);
 } // namespace higs

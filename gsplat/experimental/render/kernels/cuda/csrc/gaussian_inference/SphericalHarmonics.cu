@@ -182,6 +182,63 @@ __global__ void spherical_harmonics_viewmat_fwd_kernel(
     colors[elem_id * 4 + c] = __float2half(val);
 }
 
+__global__ void spherical_harmonics_viewmat_indexed_fwd_kernel(
+    const int active_N,
+    const int source_N,
+    const int K,
+    const int degrees_to_use,
+    const float *__restrict__ means,
+    const float *__restrict__ viewmat,
+    const float *__restrict__ coeffs,
+    const void *__restrict__ active_indices,
+    const bool active_indices_int64,
+    const uint32_t *__restrict__ masks,
+    float bias,
+    float min_value,
+    __half *__restrict__ colors
+)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= active_N * 3)
+    {
+        return;
+    }
+    const int output_idx = idx / 3;
+    const int c          = idx % 3;
+    if(!(masks[output_idx >> 5] & (1u << (output_idx & 0x1Fu))))
+    {
+        return;
+    }
+    const int64_t source_idx
+        = active_indices_int64 ? reinterpret_cast<const int64_t *>(active_indices)[output_idx]
+                               : reinterpret_cast<const int32_t *>(active_indices)[output_idx];
+    if(source_idx < 0 || source_idx >= source_N)
+    {
+        return;
+    }
+
+    float3 dir_n{};
+    if(degrees_to_use > 0)
+    {
+        const float cam_x = -(viewmat[0] * viewmat[3] + viewmat[4] * viewmat[7] + viewmat[8] * viewmat[11]);
+        const float cam_y = -(viewmat[1] * viewmat[3] + viewmat[5] * viewmat[7] + viewmat[9] * viewmat[11]);
+        const float cam_z = -(viewmat[2] * viewmat[3] + viewmat[6] * viewmat[7] + viewmat[10] * viewmat[11]);
+        dir_n             = GetViewDir(means, source_N, source_idx, cam_x, cam_y, cam_z);
+    }
+
+    float val;
+    EvaluteSHCoeffs(
+        degrees_to_use,
+        c,
+        dir_n,
+        coeffs + source_idx * K * 3,
+        bias,
+        min_value,
+        val
+    );
+    colors[output_idx * 4 + c] = __float2half(val);
+}
+
 // Unified K=16 SH forward kernel for raw (float/half) and compressed (32B/16B) inputs.
 // Uses compile-time SHInputMode to select the coefficient loading path; all other logic
 // (compaction, SH evaluation, output packing) is shared.
@@ -242,7 +299,9 @@ __global__ void __launch_bounds__(SHEVAL_CTA_SIZE, SHEVAL_MIN_CTAS) spherical_ha
     }
 
     const float3 dir_n = GetViewDir(means, N, work_idx, cam_x, cam_y, cam_z);
-    EvalSHForGaussian<MODE>(dir_n, work_idx, N, degrees_to_use, input_data, bias, min_value, decode_params, colors);
+    EvalSHForGaussian<MODE>(
+        dir_n, work_idx, N, work_idx, degrees_to_use, input_data, bias, min_value, decode_params, colors
+    );
 }
 
 void launch_spherical_harmonics_fwd_kernel(
@@ -448,6 +507,49 @@ void launch_spherical_harmonics_viewmat_fwd_kernel(
         viewmat.data_ptr<float>(),
         coeffs.data_ptr<float>(),
         masks_ptr,
+        bias,
+        min_value,
+        reinterpret_cast<__half *>(colors.data_ptr<at::Half>())
+    );
+}
+
+void launch_spherical_harmonics_viewmat_indexed_fwd_kernel(
+    int32_t degrees_to_use,
+    const at::Tensor means,
+    const at::Tensor viewmat,
+    const at::Tensor coeffs,
+    const at::Tensor active_indices,
+    const at::Tensor masks,
+    float bias,
+    float min_value,
+    at::Tensor colors
+)
+{
+    const int source_N = means.numel() / 3;
+    const int active_N = active_indices.numel();
+    if(active_N == 0)
+    {
+        return;
+    }
+    const int K = coeffs.size(-2);
+    const int64_t n_elements = static_cast<int64_t>(active_N) * 3;
+    const dim3 threads(SHEVAL_CTA_SIZE);
+    const dim3 grid((n_elements + threads.x - 1) / threads.x);
+    spherical_harmonics_viewmat_indexed_fwd_kernel<<<
+        grid,
+        threads,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        active_N,
+        source_N,
+        K,
+        degrees_to_use,
+        means.data_ptr<float>(),
+        viewmat.data_ptr<float>(),
+        coeffs.data_ptr<float>(),
+        active_indices.data_ptr(),
+        active_indices.scalar_type() == at::kLong,
+        reinterpret_cast<const uint32_t *>(masks.data_ptr<int32_t>()),
         bias,
         min_value,
         reinterpret_cast<__half *>(colors.data_ptr<at::Half>())
