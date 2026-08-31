@@ -176,7 +176,21 @@ __device__ __forceinline__ void node_visibility_and_size(
         const float corner_x = fmaxf(cx, static_cast<float>(image_width) - cx);
         const float corner_y = fmaxf(cy, static_cast<float>(image_height) - cy);
         const float r_corner = sqrtf(corner_x * corner_x + corner_y * corner_y);
-        const float theta_max = r_corner / fmaxf(fminf(fx, fy), 1e-6f);
+        // theta_max = r_corner/f 是等距近似，负畸变系数下(θ_d=θ·poly<θ)会低估真实
+        // FOV 边界，把边缘/近处大张角 node 误剔成空洞。用畸变多项式几次不动点
+        // 迭代 θ=(r_corner/f)/poly(θ) 把 theta_max 修正到真实入射角。
+        const float r_over_f = r_corner / fmaxf(fminf(fx, fy), 1e-6f);
+        float theta_max = r_over_f;
+#pragma unroll
+        for(int it = 0; it < 3; ++it)
+        {
+            const float tm2 = theta_max * theta_max;
+            const float tm4 = tm2 * tm2;
+            const float tm6 = tm4 * tm2;
+            const float tm8 = tm4 * tm4;
+            const float poly = 1.0f + k1 * tm2 + k2 * tm4 + k3 * tm6 + k4 * tm8;
+            theta_max = r_over_f / fmaxf(poly, 0.05f);
+        }
         const float ang_r = radius / distance;
         visible = (theta - ang_r) <= theta_max;
         const float t2 = theta * theta;
@@ -193,9 +207,15 @@ __device__ __forceinline__ void node_visibility_and_size(
         projected = 2.0f * size * K[0] / distance;
     }
     // Near nodes: force refinement to exact leaves so close-up detail is kept.
-    if(near_full_dist > 0.0f && distance < near_full_dist)
+    // 近处 node 张角大、易跨 FOV 边界，用中心 theta 的 FOV 剔除会把近处大物体
+    // 误剔成空洞；近处强制可见并细化到 exact leaf，避免近处 GS 被裁切。
+    // 用"包围球边缘"而非节点中心判断距离(distance - radius)：粗层大节点中心可能
+    // 离相机很远，但包围球边缘可能已贴近相机——只用中心距离会漏判，导致这类大节点
+    // 被角度测试整体剔除，其下所有真正在近处的叶子点被连带剪掉、永远不会展开。
+    if(near_full_dist > 0.0f && (distance - radius) < near_full_dist)
     {
         projected = 1e30f;
+        visible = true;
     }
 }
 
