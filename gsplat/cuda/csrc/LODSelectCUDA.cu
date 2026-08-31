@@ -175,7 +175,15 @@ __device__ __forceinline__ void node_visibility_and_size(
         // angular radius so boundary-straddling nodes are kept.
         const float corner_x = fmaxf(cx, static_cast<float>(image_width) - cx);
         const float corner_y = fmaxf(cy, static_cast<float>(image_height) - cy);
-        const float r_corner = sqrtf(corner_x * corner_x + corner_y * corner_y);
+        const float r_corner_base = sqrtf(corner_x * corner_x + corner_y * corner_y);
+        // 只对窄FOV(长焦)相机放宽余量：长焦本身视场角小，边界附近的角度近似误差占比
+        // 更大，容易把远处本该可见的路面/物体判成不可见("挖空")；长焦又天生看得远，
+        // 这类远处细节更重要，值得多送一点进渲染器。真正宽FOV鱼眼的视场边界本来就够
+        // 松，没有这个问题，不额外放宽，避免不必要的过量选取。
+        // 真正精确的取舍留给渲染端的 fisheye_max_theta 剔除(见 _maybe_native_fisheye_kwargs)。
+        const float base_half_angle = r_corner_base / fmaxf(fminf(fx, fy), 1e-6f);
+        const float narrow_fov_margin = (base_half_angle < 0.6f) ? 1.15f : 1.0f;
+        const float r_corner = narrow_fov_margin * r_corner_base;
         // theta_max = r_corner/f 是等距近似，负畸变系数下(θ_d=θ·poly<θ)会低估真实
         // FOV 边界，把边缘/近处大张角 node 误剔成空洞。用畸变多项式几次不动点
         // 迭代 θ=(r_corner/f)/poly(θ) 把 theta_max 修正到真实入射角。
@@ -191,8 +199,30 @@ __device__ __forceinline__ void node_visibility_and_size(
             const float poly = 1.0f + k1 * tm2 + k2 * tm4 + k3 * tm6 + k4 * tm8;
             theta_max = r_over_f / fmaxf(poly, 0.05f);
         }
-        const float ang_r = radius / distance;
-        visible = (theta - ang_r) <= theta_max;
+        // ang_r(节点包围球的角度宽容度)随距离增大而趋近 0——远处节点几乎没有容错
+        // 空间，角度计算一点点误差(theta_max 迭代残差、浮点误差)就会把它判成"刚好出了
+        // 视场"，表现为长焦相机看得远时路面隔三差五出现空洞。加一个不随距离衰减的
+        // 最小角度宽容度(0.02rad≈1.15°)，让远处节点也保留一点硬性容错。
+        const float ang_r = fmaxf(radius / distance, 0.02f);
+        // 角度锥测试的宽容度(ang_r)始终随距离衰减，无论加多少余量/下限都治标不治本。
+        // 窄FOV(长焦)相机的真实几何本来就接近针孔(误差主要来自畸变外推，而不是投影
+        // 模型本身)，改用针孔专用的视锥面测试(sphere_visible)：它的宽容度就是节点
+        // 半径本身(世界坐标单位)，不会像角度锥那样随距离被除小，远处节点也能得到跟
+        // 近处一样比例的容错空间。宽FOV鱼眼真的需要锥形视场，保留角度锥测试。
+        if(base_half_angle < 0.6f)
+        {
+            // sphere_visible 用的是精确边界，没有余量。乘法余量(radius*1.15)对大节点
+            // 不公平：一个覆盖大范围的粗糙 proxy 半径动辄几十米，乘 1.15 就能凭空多探出
+            // 好几米，把本该在视场外的一大片(合并了错误颜色)内容整体判成"可见"，画成一条
+            // 明显的错色色块/线条。改成加法余量且封顶(<=2米)：小节点按比例补偿边界误差，
+            // 大节点最多只多探出 2 米，不会因为半径本身就大而被过度放宽。
+            const float margin_extra = fminf(radius * (narrow_fov_margin - 1.0f), 2.0f);
+            visible = sphere_visible(x, y, z, radius + margin_extra, w2c, frustum_planes);
+        }
+        else
+        {
+            visible = (theta - ang_r) <= theta_max;
+        }
         const float t2 = theta * theta;
         const float t4 = t2 * t2;
         const float t6 = t4 * t2;
