@@ -28,6 +28,7 @@
 namespace higs
 {
 struct SHDecodeParams; // defined in SHCompression.h (CUDA-only)
+struct FThetaCoefficients;
 
 // Projection-only launch (FUSE_SH=false). Supports arbitrary B, C.
 void launch_projection_fwd_kernel(
@@ -51,7 +52,8 @@ void launch_projection_fwd_kernel(
     at::Tensor means2d,                    // [1, 1, N, 2]
     at::Tensor depths,                     // [1, 1, N]
     at::Tensor conics,                     // [1, 1, N, 4] half {l0,l1,l2,opacity}
-    at::optional<at::Tensor> compensations // [1, 1, N] optional
+    at::optional<at::Tensor> compensations, // [1, 1, N] optional
+    const FThetaCoefficients &ftheta_coeffs
 );
 
 // Projection-only launch over a compact active set. Source attributes are read
@@ -78,7 +80,8 @@ void launch_projection_indexed_kernel(
     at::Tensor means2d, // [1, 1, active_N, 2]
     at::Tensor depths,  // [1, 1, active_N]
     at::Tensor conics,  // [1, 1, active_N, 4] half
-    const at::optional<at::Tensor> &out_colors // [active_N, 4] half, optional
+    const at::optional<at::Tensor> &out_colors, // [active_N, 4] half, optional
+    const FThetaCoefficients &ftheta_coeffs
 );
 
 // Fused projection + SH evaluation launch (FUSE_SH=true).
@@ -113,6 +116,7 @@ void launch_projection_sh_fused_kernel(
     at::Tensor colors,                     // [N, 4] half {R,G,B,0}
     at::optional<at::Tensor> compensations, // [1, 1, N] optional
     const at::optional<at::Tensor> radial_coeffs, // [4] float32 (k1..k4), optional; FISHEYE-only
-    const float fisheye_max_theta // >0: cull splats past this cam-space angle (rad); 0=off
+    const float fisheye_max_theta, // >0: cull splats past this cam-space angle (rad); 0=off
+    const FThetaCoefficients &ftheta_coeffs
 );
 } // namespace higs
