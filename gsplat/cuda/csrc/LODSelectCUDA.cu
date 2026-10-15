@@ -41,6 +41,63 @@ __global__ void build_binary_children_kernel(
     children[parent * 2 + slot] = static_cast<int32_t>(node);
 }
 
+__global__ void map_active_resident_kernel(
+    int64_t count,
+    const int32_t *__restrict__ logical_ids,
+    const int32_t *__restrict__ resident_slots,
+    int32_t resident_slot_count,
+    const int32_t *__restrict__ node_pages,
+    int32_t node_count,
+    int32_t page_points,
+    int32_t exact_capacity,
+    int32_t proxy_pool_offset,
+    int32_t *__restrict__ physical_ids,
+    int32_t *__restrict__ counts
+)
+{
+    const int64_t index
+        = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(index >= count)
+    {
+        return;
+    }
+
+    const int32_t logical_id = logical_ids[index];
+    int32_t physical_id = -1;
+    if(logical_id >= 0 && logical_id < exact_capacity)
+    {
+        atomicAdd(counts, 1);
+        const int32_t page = logical_id / page_points;
+        if(page < resident_slot_count)
+        {
+            const int32_t slot = resident_slots[page];
+            if(slot >= 0)
+            {
+                physical_id
+                    = slot * page_points + logical_id % page_points;
+                atomicAdd(counts + 1, 1);
+            }
+        }
+    }
+    else if(logical_id >= exact_capacity)
+    {
+        const int32_t node = logical_id - exact_capacity;
+        if(node < node_count)
+        {
+            const int32_t page = node_pages[node];
+            if(
+                page >= 0 && page < resident_slot_count
+                && resident_slots[page] >= 0
+            )
+            {
+                physical_id = proxy_pool_offset + node;
+                atomicAdd(counts + 2, 1);
+            }
+        }
+    }
+    physical_ids[index] = physical_id;
+}
+
 __global__ void initialize_frontier_kernel(
     int32_t *__restrict__ frontier,
     int32_t *__restrict__ counts,
@@ -65,6 +122,8 @@ __global__ void initialize_frontier_kernel(
         counts[1] = 0;
         counts[2] = 0;
         counts[3] = 0;
+        counts[4] = 0;
+        counts[5] = 0;
 
         const float fx = K[0];
         const float fy = K[4];
@@ -582,15 +641,14 @@ void launch_lod_select_active_topdown_kernels(
     int exact_capacity,
     int proxy_pool_offset,
     at::Tensor &active_ids,
-    at::Tensor &counts
+    at::Tensor &counts,
+    at::Tensor &frontier_a,
+    at::Tensor &frontier_b,
+    at::Tensor &frustum_planes
 )
 {
     const int64_t num_nodes = centers.size(0);
     const int64_t root_count = root_ids.size(0);
-    auto options = centers.options().dtype(at::kInt);
-    auto frontier_a = at::empty({num_nodes}, options);
-    auto frontier_b = at::empty({num_nodes}, options);
-    auto frustum_planes = at::empty({5, 4}, centers.options());
     const auto stream = at::cuda::getCurrentCUDAStream();
     const int initialize_blocks
         = static_cast<int>((root_count + kThreads - 1) / kThreads);
@@ -658,5 +716,40 @@ void launch_lod_select_active_topdown_kernels(
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+}
+
+void launch_lod_map_active_resident_kernel(
+    const at::Tensor &logical_ids,
+    const at::Tensor &resident_slots,
+    const at::Tensor &node_pages,
+    int page_points,
+    int exact_capacity,
+    int proxy_pool_offset,
+    at::Tensor &physical_ids,
+    at::Tensor &counts
+)
+{
+    const int64_t count = logical_ids.numel();
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    counts.zero_();
+    if(count == 0)
+    {
+        return;
+    }
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    map_active_resident_kernel<<<blocks, kThreads, 0, stream>>>(
+        count,
+        logical_ids.data_ptr<int32_t>(),
+        resident_slots.data_ptr<int32_t>(),
+        static_cast<int32_t>(resident_slots.numel()),
+        node_pages.data_ptr<int32_t>(),
+        static_cast<int32_t>(node_pages.numel()),
+        page_points,
+        exact_capacity,
+        proxy_pool_offset,
+        physical_ids.data_ptr<int32_t>(),
+        counts.data_ptr<int32_t>()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 } // namespace gsplat

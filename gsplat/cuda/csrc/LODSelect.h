@@ -68,6 +68,20 @@ void launch_lod_select_active_topdown_kernels(
     int exact_capacity,
     int proxy_pool_offset,
     at::Tensor &active_ids,
+    at::Tensor &counts,
+    at::Tensor &frontier_a,
+    at::Tensor &frontier_b,
+    at::Tensor &frustum_planes
+);
+
+void launch_lod_map_active_resident_kernel(
+    const at::Tensor &logical_ids,
+    const at::Tensor &resident_slots,
+    const at::Tensor &node_pages,
+    int page_points,
+    int exact_capacity,
+    int proxy_pool_offset,
+    at::Tensor &physical_ids,
     at::Tensor &counts
 );
 } // namespace gsplat

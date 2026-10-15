@@ -1255,6 +1255,18 @@ TORCH_LIBRARY(gsplat, m)
         "int image_width, int image_height, float near_plane, float error_threshold_px, float near_full_dist, int max_depth, "
         "int exact_capacity, int proxy_pool_offset, int camera_model, Tensor? radial_coeffs) -> (Tensor, int, int)"
     );
+    m.def(
+        "lod_select_active_topdown_workspace(Tensor centers, Tensor sizes, Tensor radii, Tensor children, Tensor is_leaf, "
+        "Tensor leaf_starts, Tensor leaf_lengths, Tensor root_ids, Tensor cam_pos, Tensor w2c, Tensor K, "
+        "int image_width, int image_height, float near_plane, float error_threshold_px, float near_full_dist, int max_depth, "
+        "int exact_capacity, int proxy_pool_offset, int camera_model, Tensor? radial_coeffs, Tensor(a!) active_ids, "
+        "Tensor(b!) frontier_a, Tensor(c!) frontier_b, Tensor(d!) counts, Tensor(e!) frustum_planes) -> (Tensor(a!), int, int, bool)"
+    );
+    m.def(
+        "lod_map_active_resident(Tensor logical_ids, Tensor resident_slots, Tensor node_pages, "
+        "int page_points, int exact_capacity, int proxy_pool_offset, "
+        "Tensor(a!) physical_ids, Tensor(b!) counts) -> (Tensor(a!), int, int, int)"
+    );
 
 #if GSPLAT_BUILD_CAMERA_WRAPPERS
     m.def(
