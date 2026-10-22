@@ -335,6 +335,64 @@ class RowOffsetStructuredSpinningLidarModelParameters(
         return torch.stack([azimuth, elevation], dim=-1)
 
 
+@dataclass(frozen=True, kw_only=True, eq=False)
+class FixedPatternLidarModelParameters(StructuredLidarModelParameters):
+    """A static angle table; row/column indices preserve acquisition order only."""
+
+    angles_rad: Tensor
+
+    def __init__(self, *, angles_rad: Tensor) -> None:
+        if (angles_rad.dtype != torch.float32 or angles_rad.ndim != 3
+                or angles_rad.shape[-1] != 2 or min(angles_rad.shape[:2]) == 0
+                or not torch.isfinite(angles_rad).all()):
+            raise ValueError('angles_rad must be finite float32 [rows, columns, 2]')
+        if (angles_rad[..., 1].abs() > math.pi / 2).any():
+            raise ValueError('elevation must be within [-pi/2, pi/2]')
+        angles = angles_rad.detach().clone().contiguous()
+        angles[..., 0] = normalize_azimuth(angles[..., 0])
+        object.__setattr__(self, 'angles_rad', angles)
+        azimuth = angles[..., 0].flatten().sort().values.double()
+        gaps = torch.diff(torch.cat((azimuth, azimuth[:1] + 2 * math.pi)))
+        largest_gap = int(gaps.argmax().item())
+        start = float(azimuth[(largest_gap + 1) % len(azimuth)].item())
+        span = float(2 * math.pi - gaps[largest_gap].item())
+        elevation = angles[..., 1]
+        margin = 8 * torch.finfo(torch.float32).eps
+        super().__init__(
+            n_rows=angles.shape[0], n_columns=angles.shape[1], fov_eps_rad=margin,
+            fov_vert_rad=FOV(start=float(elevation.max()) + margin,
+                            span=float(elevation.max() - elevation.min()) + 2 * margin,
+                            direction=SpinningDirection.CLOCKWISE),
+            fov_horiz_rad=FOV(start=start - margin, span=min(2 * math.pi, span + 2 * margin),
+                             direction=SpinningDirection.COUNTER_CLOCKWISE))
+
+    @property
+    def device(self):
+        return self.angles_rad.device
+
+    @property
+    def dtype(self):
+        return self.angles_rad.dtype
+
+    @property
+    def spinning_direction(self):
+        return self.fov_horiz_rad.direction
+
+    def create_elements(self) -> Tensor:
+        columns = torch.arange(self.n_columns, device=self.device, dtype=torch.int32).repeat(self.n_rows)
+        rows = torch.arange(self.n_rows, device=self.device, dtype=torch.int32).repeat_interleave(self.n_columns)
+        return torch.stack((columns, rows), dim=-1)
+
+    def elements_to_sensor_angles(self, elements: Tensor) -> Tensor:
+        return self.angles_rad[elements[..., 1].long(), elements[..., 0].long()]
+
+    def __eq__(self, other):
+        return isinstance(other, FixedPatternLidarModelParameters) and torch.equal(self.angles_rad, other.angles_rad)
+
+    def __hash__(self):
+        return hash(_tensor_hash(self.angles_rad))
+
+
 # TODO: merge this class into RowOffsetStructuredSpinningLidarModelParametersExt
 @dataclass
 class LidarTiling:
@@ -831,8 +889,17 @@ def compute_histogram_equalization(
         )
 
     hist2d, _, _ = compute_hist2d(n_bins_azimuth)
+    if isinstance(parameters, FixedPatternLidarModelParameters):
+        elevation_bins = np.searchsorted(edges_elevation_np, angles_elevation_np, side='right')
+        samples = np.stack((angles_azimuth_np, elevation_bins), axis=-1)
+        _, multiplicity = np.unique(samples, axis=0, return_counts=True)
+        if multiplicity.max() > max_pts_per_tile:
+            raise ValueError('Fixed pattern has too many coincident rays in one elevation bin')
     while hist2d.max() > max_pts_per_tile:
         n_bins_azimuth += 1
+        if isinstance(parameters, FixedPatternLidarModelParameters):
+            if n_bins_azimuth * n_bins_elevation > 1000000:
+                raise ValueError('Fixed pattern cannot fit the LiDAR tile limit without resampling')
         hist2d, _, _ = compute_hist2d(n_bins_azimuth)
 
     assert isinstance(cdf_elevation, torch.Tensor)

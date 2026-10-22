@@ -149,8 +149,9 @@ class _RowOffsetStructuredSpinningLidarModel(_StructuredSpinningLidarModel):
         # Force using our reference fov
         # NOTE: there must be no other params attributes that depend on fov,
         # or else they need to be updated as well
-        object.__setattr__(params, "fov_horiz_rad", self._compute_fov_horiz_rad(params))
-        object.__setattr__(params, "fov_vert_rad", self._compute_fov_vert_rad(params))
+        if not hasattr(params, 'angles_rad'):
+            object.__setattr__(params, "fov_horiz_rad", self._compute_fov_horiz_rad(params))
+            object.__setattr__(params, "fov_vert_rad", self._compute_fov_vert_rad(params))
 
         super().__init__(params)
 
@@ -158,7 +159,7 @@ class _RowOffsetStructuredSpinningLidarModel(_StructuredSpinningLidarModel):
     def focal_lengths(self) -> Tensor:
         # Just a dummy focal length.
         # TODO: fix the class hierarchy to properly accomodate lidar sensors
-        return torch.ones(2, dtype=torch.float32, device=self.row_elevations_rad.device)
+        return torch.ones(2, dtype=torch.float32, device=self.device)
 
     @property
     def principal_points(self) -> Tensor:
@@ -278,8 +279,12 @@ class _RowOffsetStructuredSpinningLidarModel(_StructuredSpinningLidarModel):
             image_points: [..., 2] as (azimuth * SCALE, elevation * SCALE).
         """
         params = self.params
-        el = params.row_elevations_rad[row]
-        az = params.column_azimuths_rad[col] + params.row_azimuth_offsets_rad[row]
+        if hasattr(params, 'angles_rad'):
+            angles = params.angles_rad[row.long(), col.long()]
+            az, el = angles.unbind(-1)
+        else:
+            el = params.row_elevations_rad[row]
+            az = params.column_azimuths_rad[col] + params.row_azimuth_offsets_rad[row]
         # Normalize azimuth to (-pi, pi] via conditional subtract/add
         az = torch.where(az > torch.pi, az - 2 * torch.pi, az)
         az = torch.where(az <= -torch.pi, az + 2 * torch.pi, az)

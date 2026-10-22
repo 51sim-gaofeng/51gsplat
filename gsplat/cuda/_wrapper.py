@@ -29,6 +29,7 @@ from gsplat.trace import trace_function
 from gsplat.cuda._lidar import (
     SpinningDirection,
     LidarModelParameters,
+    FixedPatternLidarModelParameters,
     RowOffsetStructuredSpinningLidarModelParameters,
     RowOffsetStructuredSpinningLidarModelParametersExt as RowOffsetStructuredSpinningLidarModelParametersExtBase,
     FOV as FOVBase,
@@ -374,6 +375,43 @@ class RowOffsetStructuredSpinningLidarModelParametersExt(
             tiles_to_elements_map=self.tiling.tiles_to_elements_map.contiguous(),
             tiles_pack_info=self.tiling.tiles_pack_info.contiguous(),
         )
+
+
+class FixedPatternLidarModelParametersExt:
+    """Fixed-angle LiDAR using the shared spherical projection and tile pipeline."""
+
+    def __init__(self, params: FixedPatternLidarModelParameters, tiling):
+        self.params = params
+        self.tiling = tiling
+        self._cpp = None
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, 'params'), name)
+
+    def to_cpp(self) -> Any:
+        if self._cpp is not None:
+            return self._cpp
+        if self.device.type != 'cuda':
+            raise ValueError('Fixed pattern native rendering requires CUDA angles')
+        constructor = _make_lazy_cuda_cls('RowOffsetStructuredSpinningLidarModelParametersExt')
+        native = constructor(
+            row_elevations_rad=torch.zeros(self.n_rows, device=self.device),
+            column_azimuths_rad=torch.zeros(self.n_columns, device=self.device),
+            row_azimuth_offsets_rad=torch.zeros(self.n_rows, device=self.device),
+            spinning_direction=self.spinning_direction.value, spinning_frequency_hz=0.0,
+            fov_vert_rad=FOV.from_base(self.fov_vert_rad).to_cpp(),
+            fov_horiz_rad=FOV.from_base(self.fov_horiz_rad).to_cpp(), fov_eps_rad=self.fov_eps_rad,
+            angles_to_columns_map=torch.zeros((2, 2), device=self.device, dtype=torch.int32),
+            n_bins_azimuth=self.tiling.n_bins_azimuth, n_bins_elevation=self.tiling.n_bins_elevation,
+            cdf_elevation=self.tiling.cdf_elevation.contiguous(),
+            cdf_dense_ray_mask=self.tiling.cdf_dense_ray_mask.contiguous(),
+            tiles_to_elements_map=self.tiling.tiles_to_elements_map.contiguous(),
+            tiles_pack_info=self.tiling.tiles_pack_info.contiguous())
+        if not hasattr(native, 'set_fixed_pattern_angles'):
+            raise RuntimeError('Rebuild gsplat with fixed-pattern LiDAR support')
+        native.set_fixed_pattern_angles(self.angles_rad)
+        self._cpp = native
+        return native
 
 
 def world_to_cam(

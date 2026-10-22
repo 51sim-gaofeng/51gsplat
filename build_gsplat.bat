@@ -39,6 +39,13 @@ rem Source = this script's own directory (the gsplat fork), no hardcoded path.
 set "GSPLAT_SRC=%~dp0"
 if "%GSPLAT_SRC:~-1%"=="\" set "GSPLAT_SRC=%GSPLAT_SRC:~0,-1%"
 
+set "GSPLAT_PREVIOUS_BUILD=%GSPLAT_SRC%\build.previous.%RANDOM%.%RANDOM%"
+if exist "%GSPLAT_PREVIOUS_BUILD%" goto :err
+if exist "%GSPLAT_SRC%\build" (
+    echo Preserving old build artifacts: "%GSPLAT_PREVIOUS_BUILD%"
+    move "%GSPLAT_SRC%\build" "%GSPLAT_PREVIOUS_BUILD%" >nul || goto :err
+)
+
 echo Building and installing gsplat from source into 4dgs env: "%GSPLAT_SRC%"
 rem -v 打印完整编译日志；ninja 并行任务数默认取 CPU 核数，可用 MAX_JOBS 覆盖。
 if not defined MAX_JOBS set "MAX_JOBS=%NUMBER_OF_PROCESSORS%"

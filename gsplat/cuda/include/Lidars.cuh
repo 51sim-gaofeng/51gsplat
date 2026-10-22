@@ -40,6 +40,7 @@ struct RowOffsetStructuredSpinningLidarModelParametersExtDevice
     const float *row_elevations_rad;
     const float *column_azimuths_rad;
     const float *row_azimuth_offsets_rad;
+    const float *fixed_pattern_angles_rad = nullptr;
 
     // Spinning direction and frequency of the lidar
     gsplat::SpinningDirection spinning_direction;
@@ -104,6 +105,10 @@ public:
     // Override shutter_relative_frame_time for lidar-specific rolling shutter timing
     __device__ float shutter_relative_frame_time(const glm::fvec2 &image_point) const
     {
+        if(parameters.lidar.fixed_pattern_angles_rad != nullptr)
+        {
+            return 0.f;
+        }
         // Unlike cameras with simple linear rolling shutter (top-to-bottom, left-to-right),
         // spinning lidars have complex timing patterns:
         // - The sensor spins (clockwise or counter-clockwise)
@@ -202,8 +207,12 @@ public:
         assert(row >= 0 && row < lidar.n_rows);
         assert(col >= 0 && col < lidar.n_columns);
 
-        const float elevation = lidar.row_elevations_rad[row];
-        float azimuth         = lidar.column_azimuths_rad[col] + lidar.row_azimuth_offsets_rad[row];
+        const int64_t element = static_cast<int64_t>(row) * lidar.n_columns + col;
+        const float elevation = lidar.fixed_pattern_angles_rad != nullptr
+            ? lidar.fixed_pattern_angles_rad[element * 2 + 1] : lidar.row_elevations_rad[row];
+        float azimuth = lidar.fixed_pattern_angles_rad != nullptr
+            ? lidar.fixed_pattern_angles_rad[element * 2]
+            : lidar.column_azimuths_rad[col] + lidar.row_azimuth_offsets_rad[row];
         // Normalize to (-pi, pi]
         if(azimuth > PI)
         {

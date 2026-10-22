@@ -578,6 +578,8 @@ TORCH_LIBRARY(gsplat, m)
         .def_readwrite(
             "row_elevations_rad", &gsplat::RowOffsetStructuredSpinningLidarModelParametersExt::row_elevations_rad
         )
+        .def("set_fixed_pattern_angles",
+             &gsplat::RowOffsetStructuredSpinningLidarModelParametersExt::set_fixed_pattern_angles)
         .def_readwrite(
             "column_azimuths_rad", &gsplat::RowOffsetStructuredSpinningLidarModelParametersExt::column_azimuths_rad
         )

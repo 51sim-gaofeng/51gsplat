@@ -1112,7 +1112,11 @@ Rasterization3DGSResult rasterization_3dgs(
     }
 
     // Only Gaussians with a positive radius on every axis are valid SH inputs.
-    at::Tensor valid_gaussians = radii.gt(0).all(-1);
+    at::Tensor valid_gaussians;
+    if((has_color && sh_degree >= 0) || (extra_signals.has_value() && extra_signals_sh_degree >= 0))
+    {
+        valid_gaussians = radii.gt(0).all(-1);
+    }
 
     // --- Prepare feature channels ----------------------------------------
     // Turn colors/extra signals into [..., C, N, D] or [nnz, D] so the

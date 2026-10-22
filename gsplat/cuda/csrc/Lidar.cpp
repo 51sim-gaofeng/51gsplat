@@ -53,6 +53,17 @@ RowOffsetStructuredSpinningLidarModelParametersExtDevice::RowOffsetStructuredSpi
     CHECK_INPUT(params.cdf_dense_ray_mask);
     CHECK_INPUT(params.tiles_pack_info);
     CHECK_INPUT(params.tiles_to_elements_map);
+    if(params.fixed_pattern_angles_rad.defined())
+    {
+        const auto &angles = params.fixed_pattern_angles_rad;
+        CHECK_INPUT(angles);
+        TORCH_CHECK(angles.scalar_type() == at::kFloat
+            && angles.device() == params.row_elevations_rad.device()
+            && angles.dim() == 3 && angles.size(0) == n_rows
+            && angles.size(1) == n_columns && angles.size(2) == 2,
+            "invalid fixed pattern angle table");
+        fixed_pattern_angles_rad = angles.data_ptr<float>();
+    }
 
     TORCH_CHECK(
         params.angles_to_columns_map.size(0) > 1 && params.angles_to_columns_map.size(1) > 1,

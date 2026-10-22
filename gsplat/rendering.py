@@ -523,6 +523,9 @@ def rasterization(
         Optional[BivariateWindshieldModelParameters], external_distortion_coeffs
     )
 
+    if lidar_coeffs is not None and hasattr(lidar_coeffs, 'angles_rad'):
+        if viewmats_rs is not None or rolling_shutter != RollingShutterType.GLOBAL:
+            raise ValueError('Fixed-pattern LiDAR currently supports a single global-shutter pose only')
     if lidar_coeffs is not None:
         width = lidar_coeffs.n_columns
         height = lidar_coeffs.n_rows

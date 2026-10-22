@@ -111,6 +111,17 @@ struct RowOffsetStructuredSpinningLidarModelParametersExt : public torch::Custom
     at::Tensor row_elevations_rad;
     at::Tensor column_azimuths_rad;
     at::Tensor row_azimuth_offsets_rad;
+    at::Tensor fixed_pattern_angles_rad;
+
+    void set_fixed_pattern_angles(at::Tensor angles)
+    {
+        TORCH_CHECK(angles.is_cuda() && angles.device() == row_elevations_rad.device()
+            && angles.scalar_type() == at::kFloat && angles.is_contiguous()
+            && angles.dim() == 3 && angles.size(0) == n_rows()
+            && angles.size(1) == n_columns() && angles.size(2) == 2,
+            "fixed pattern angles must be contiguous CUDA float32 [rows, columns, 2]");
+        fixed_pattern_angles_rad = std::move(angles);
+    }
 
     SpinningDirection spinning_direction;
     float spinning_frequency_hz;
