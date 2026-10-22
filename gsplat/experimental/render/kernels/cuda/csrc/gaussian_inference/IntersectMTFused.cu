@@ -214,26 +214,37 @@ void IntersectMTFused::execute(
         m_mtGaussCounts   = at::zeros({(int64_t)m_nMacroTiles}, opts_i32);
         m_mtGaussOffsets  = at::zeros({(int64_t)m_nMacroTiles + 1}, opts_i32);
         m_mtBatchOffsets  = at::zeros({(int64_t)m_nMacroTiles + 1}, opts_i32);
-        m_mtIsectCapacity = 0;
         static_assert(
             (FUSED_GAUSS_BATCH_SIZE & (FUSED_GAUSS_BATCH_SIZE - 1)) == 0, "FUSED_GAUSS_BATCH_SIZE must be a power of 2"
         );
         m_mtOffsets = std::make_unique<higs::MTOffsets>(m_nMacroTiles, CEIL_LOG2<FUSED_GAUSS_BATCH_SIZE>);
     }
 
-    if(!m_mtChunkMetaWords.defined() || m_mtChunkMetaWords.size(0) != (int64_t)m_chunkMetaWordsSize)
+    if(!m_mtChunkMetaWords.defined() || m_mtChunkMetaWords.size(0) < (int64_t)m_chunkMetaWordsSize)
     {
-        m_mtChunkMetaWords = at::empty({(int64_t)m_chunkMetaWordsSize}, opts_i32);
+        const int64_t current = m_mtChunkMetaWords.defined() ? m_mtChunkMetaWords.size(0) : 0;
+        m_mtChunkMetaWords = at::empty(
+            {grow_buffer_capacity(current, m_chunkMetaWordsSize)},
+            opts_i32
+        );
     }
 
-    if(!m_mtChunkTileCarry.defined() || m_mtChunkTileCarry.size(0) != (int64_t)m_chunkTileCarrySize)
+    if(!m_mtChunkTileCarry.defined() || m_mtChunkTileCarry.size(0) < (int64_t)m_chunkTileCarrySize)
     {
-        m_mtChunkTileCarry = at::empty({(int64_t)m_chunkTileCarrySize}, opts_i32);
+        const int64_t current = m_mtChunkTileCarry.defined() ? m_mtChunkTileCarry.size(0) : 0;
+        m_mtChunkTileCarry = at::empty(
+            {grow_buffer_capacity(current, m_chunkTileCarrySize)},
+            opts_i32
+        );
     }
 
-    if(!m_mtChunkTileSums.defined() || m_mtChunkTileSums.size(0) != (int64_t)m_chunkTileCarrySize)
+    if(!m_mtChunkTileSums.defined() || m_mtChunkTileSums.size(0) < (int64_t)m_chunkTileCarrySize)
     {
-        m_mtChunkTileSums = at::empty({(int64_t)m_chunkTileCarrySize}, opts_i32);
+        const int64_t current = m_mtChunkTileSums.defined() ? m_mtChunkTileSums.size(0) : 0;
+        m_mtChunkTileSums = at::empty(
+            {grow_buffer_capacity(current, m_chunkTileCarrySize)},
+            opts_i32
+        );
     }
 
     // Stage 1: macro-tile count
@@ -279,11 +290,22 @@ void IntersectMTFused::execute(
         // together, sharing m_mtIsectCapacity.
         if(m_nMacroIsects > m_mtIsectCapacity)
         {
-            m_mtDepthKeys     = at::empty({m_nMacroIsects}, opts_i32);
-            m_mtGaussIds      = at::empty({m_nMacroIsects}, opts_i32);
-            m_mtTmpDepthKeys  = at::empty({m_nMacroIsects}, opts_i32);
-            m_mtTmpGaussIds   = at::empty({m_nMacroIsects}, opts_i32);
-            m_mtIsectCapacity = m_nMacroIsects;
+            const int64_t new_capacity = grow_buffer_capacity(
+                m_mtIsectCapacity,
+                m_nMacroIsects
+            );
+            // This aliases one of the old ID buffers after sorting. Drop the
+            // extra reference before replacing those buffers.
+            m_mtGaussIdsSorted = at::Tensor();
+            m_mtDepthKeys = at::Tensor();
+            m_mtGaussIds = at::Tensor();
+            m_mtTmpDepthKeys = at::Tensor();
+            m_mtTmpGaussIds = at::Tensor();
+            m_mtDepthKeys     = at::empty({new_capacity}, opts_i32);
+            m_mtGaussIds      = at::empty({new_capacity}, opts_i32);
+            m_mtTmpDepthKeys  = at::empty({new_capacity}, opts_i32);
+            m_mtTmpGaussIds   = at::empty({new_capacity}, opts_i32);
+            m_mtIsectCapacity = new_capacity;
         }
 
         // Stage 4: Macro-tile fill
@@ -342,8 +364,12 @@ void IntersectMTFused::rasterize(
     const int32_t num_batches = max(m_numRasterBatches, 1);
     if(num_batches > m_metadataCapacity)
     {
-        m_activeMask       = at::zeros({num_batches}, opts_i32);
-        m_metadataCapacity = num_batches;
+        const int64_t new_capacity = grow_buffer_capacity(
+            m_metadataCapacity,
+            num_batches
+        );
+        m_activeMask       = at::zeros({new_capacity}, opts_i32);
+        m_metadataCapacity = new_capacity;
     }
 
     // worst-case tile buffer: each batch can write up to MACRO_TILE_SIZE tiles
@@ -352,8 +378,13 @@ void IntersectMTFused::rasterize(
     const int64_t max_tile_buf_size = max_tiles * m_tileSize * m_tileSize * 4;
     if(max_tile_buf_size > m_tileBufferCapacity)
     {
-        m_tileBuffer         = at::empty({max_tile_buf_size}, at::TensorOptions().dtype(at::kHalf).device(at::kCUDA));
-        m_tileBufferCapacity = max_tile_buf_size;
+        const int64_t new_capacity = grow_buffer_capacity(
+            m_tileBufferCapacity,
+            max_tile_buf_size
+        );
+        m_tileBuffer         = at::Tensor();
+        m_tileBuffer         = at::empty({new_capacity}, at::TensorOptions().dtype(at::kHalf).device(at::kCUDA));
+        m_tileBufferCapacity = new_capacity;
     }
 
     // Fused macro-tile rasterize kernel (skipped when no intersections)
