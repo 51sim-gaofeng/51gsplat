@@ -844,6 +844,9 @@
         <span class="n">Optional</span><span class="p">[</span><span class="n">BivariateWindshieldModelParameters</span><span class="p">],</span> <span class="n">external_distortion_coeffs</span>
     <span class="p">)</span>
 
+    <span class="k">if</span> <span class="n">lidar_coeffs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">lidar_coeffs</span><span class="p">,</span> <span class="s1">'angles_rad'</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">viewmats_rs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">rolling_shutter</span> <span class="o">!=</span> <span class="n">RollingShutterType</span><span class="o">.</span><span class="n">GLOBAL</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'Fixed-pattern LiDAR currently supports a single global-shutter pose only'</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">lidar_coeffs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">width</span> <span class="o">=</span> <span class="n">lidar_coeffs</span><span class="o">.</span><span class="n">n_columns</span>
         <span class="n">height</span> <span class="o">=</span> <span class="n">lidar_coeffs</span><span class="o">.</span><span class="n">n_rows</span>
