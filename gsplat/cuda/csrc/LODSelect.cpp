@@ -16,6 +16,48 @@
 
 namespace gsplat
 {
+namespace
+{
+const char *lod_select_error_name(int32_t code)
+{
+    switch(code)
+    {
+        case 1: return "invalid_node";
+        case 2: return "frontier_overflow";
+        case 3: return "invalid_child";
+        case 4: return "invalid_leaf_range";
+        case 5: return "output_overflow";
+        default: return "unknown";
+    }
+}
+
+void check_lod_select_diagnostics(
+    const int32_t *diagnostics,
+    const char *operation
+)
+{
+    const int32_t code = diagnostics[0];
+    TORCH_CHECK(
+        code == 0,
+        operation,
+        ": CUDA selector invariant failed; code=",
+        code,
+        " (",
+        lod_select_error_name(code),
+        "), level=",
+        diagnostics[1],
+        ", node=",
+        diagnostics[2],
+        ", value=",
+        diagnostics[3],
+        ", capacity=",
+        diagnostics[4],
+        ", auxiliary=",
+        diagnostics[5]
+    );
+}
+} // namespace
+
 at::Tensor lod_build_binary_children(const at::Tensor &parents)
 {
     DEVICE_GUARD(parents);
@@ -113,7 +155,7 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     auto int_options = centers.options().dtype(at::kInt);
     auto proxy_ids = at::empty({M}, int_options);
     auto leaf_ids = at::empty({M}, int_options);
-    auto counts = at::zeros({4}, int_options);
+    auto counts = at::zeros({10}, int_options);
 
     launch_lod_select_topdown_kernels(
         centers,
@@ -143,6 +185,10 @@ std::tuple<at::Tensor, at::Tensor> lod_select_topdown(
     // buffers after this call returns.
     auto counts_cpu = counts.to(at::kCPU);
     const auto *count_data = counts_cpu.const_data_ptr<int32_t>();
+    check_lod_select_diagnostics(
+        count_data + 4,
+        "lod_select_topdown"
+    );
     const int64_t proxy_count = count_data[2];
     const int64_t leaf_count = count_data[3];
     const int next_frontier_slot = (static_cast<int>(max_depth) & 1) ^ 1;
@@ -288,7 +334,7 @@ std::tuple<at::Tensor, int64_t, int64_t> lod_select_active_topdown(
         {exact_capacity + centers.size(0)},
         options
     );
-    auto counts = at::zeros({6}, options);
+    auto counts = at::zeros({12}, options);
     launch_lod_select_active_topdown_kernels(
         centers,
         sizes,
@@ -316,6 +362,10 @@ std::tuple<at::Tensor, int64_t, int64_t> lod_select_active_topdown(
     );
     auto counts_cpu = counts.to(at::kCPU);
     const auto *data = counts_cpu.const_data_ptr<int32_t>();
+    check_lod_select_diagnostics(
+        data + 6,
+        "lod_select_active_topdown"
+    );
     const int64_t active_count = data[2];
     const int64_t exact_leaf_count = data[4];
     const int64_t proxy_count = data[5];

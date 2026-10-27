@@ -17,6 +17,40 @@ namespace
 {
 constexpr int kThreads = 256;
 
+enum class LODSelectError : int32_t
+{
+    None = 0,
+    InvalidNode = 1,
+    FrontierOverflow = 2,
+    InvalidChild = 3,
+    InvalidLeafRange = 4,
+    OutputOverflow = 5,
+};
+
+__device__ __forceinline__ void record_lod_error(
+    int32_t *__restrict__ diagnostics,
+    LODSelectError error,
+    int32_t level,
+    int32_t node,
+    int32_t value,
+    int32_t capacity,
+    int32_t auxiliary
+)
+{
+    if(atomicCAS(
+           diagnostics,
+           static_cast<int32_t>(LODSelectError::None),
+           static_cast<int32_t>(error))
+       == static_cast<int32_t>(LODSelectError::None))
+    {
+        diagnostics[1] = level;
+        diagnostics[2] = node;
+        diagnostics[3] = value;
+        diagnostics[4] = capacity;
+        diagnostics[5] = auxiliary;
+    }
+}
+
 __global__ void build_binary_children_kernel(
     int64_t num_nodes,
     const int64_t *__restrict__ parents,
@@ -46,6 +80,8 @@ __global__ void initialize_frontier_kernel(
     int32_t *__restrict__ counts,
     const int32_t *__restrict__ root_ids,
     int32_t root_count,
+    int32_t frontier_capacity,
+    int32_t *__restrict__ diagnostics,
     const float *__restrict__ K,
     int width,
     int height,
@@ -56,7 +92,22 @@ __global__ void initialize_frontier_kernel(
     const int32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if(index < root_count)
     {
-        frontier[index] = root_ids[index];
+        if(index < frontier_capacity)
+        {
+            frontier[index] = root_ids[index];
+        }
+        else
+        {
+            record_lod_error(
+                diagnostics,
+                LODSelectError::FrontierOverflow,
+                -1,
+                root_ids[index],
+                root_count,
+                frontier_capacity,
+                index
+            );
+        }
     }
 
     if(blockIdx.x == 0 && threadIdx.x == 0)
@@ -251,6 +302,8 @@ __device__ __forceinline__ void node_visibility_and_size(
 
 __global__ void traverse_level_kernel(
     int32_t launch_capacity,
+    int32_t frontier_capacity,
+    int32_t level,
     const int32_t *__restrict__ current_count,
     const int32_t *__restrict__ current_frontier,
     int32_t *__restrict__ next_count,
@@ -276,7 +329,8 @@ __global__ void traverse_level_kernel(
     int32_t *__restrict__ proxy_count,
     int32_t *__restrict__ proxy_ids,
     int32_t *__restrict__ leaf_count,
-    int32_t *__restrict__ leaf_ids
+    int32_t *__restrict__ leaf_ids,
+    int32_t *__restrict__ diagnostics
 )
 {
     const int32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -286,6 +340,19 @@ __global__ void traverse_level_kernel(
     }
 
     const int32_t node = current_frontier[index];
+    if(node < 0 || node >= frontier_capacity)
+    {
+        record_lod_error(
+            diagnostics,
+            LODSelectError::InvalidNode,
+            level,
+            node,
+            index,
+            frontier_capacity,
+            *current_count
+        );
+        return;
+    }
     const float x = centers[node * 3];
     const float y = centers[node * 3 + 1];
     const float z = centers[node * 3 + 2];
@@ -304,28 +371,89 @@ __global__ void traverse_level_kernel(
 
     if(projected <= error_threshold_px)
     {
-        proxy_ids[atomicAdd(proxy_count, 1)] = node;
+        const int32_t output = atomicAdd(proxy_count, 1);
+        if(output < frontier_capacity)
+        {
+            proxy_ids[output] = node;
+        }
+        else
+        {
+            record_lod_error(
+                diagnostics,
+                LODSelectError::OutputOverflow,
+                level,
+                node,
+                output,
+                frontier_capacity,
+                0
+            );
+        }
         return;
     }
 
     if(is_leaf[node])
     {
-        leaf_ids[atomicAdd(leaf_count, 1)] = node;
+        const int32_t output = atomicAdd(leaf_count, 1);
+        if(output < frontier_capacity)
+        {
+            leaf_ids[output] = node;
+        }
+        else
+        {
+            record_lod_error(
+                diagnostics,
+                LODSelectError::OutputOverflow,
+                level,
+                node,
+                output,
+                frontier_capacity,
+                1
+            );
+        }
         return;
     }
 
     const int32_t left = children[node * 2];
     const int32_t right = children[node * 2 + 1];
-    if(left >= 0 && right >= 0)
+    if(left < 0 || left >= frontier_capacity
+       || right < 0 || right >= frontier_capacity)
     {
-        const int32_t output = atomicAdd(next_count, 2);
+        record_lod_error(
+            diagnostics,
+            LODSelectError::InvalidChild,
+            level,
+            node,
+            left,
+            frontier_capacity,
+            right
+        );
+        return;
+    }
+
+    const int32_t output = atomicAdd(next_count, 2);
+    if(output <= frontier_capacity - 2)
+    {
         next_frontier[output] = left;
         next_frontier[output + 1] = right;
+    }
+    else
+    {
+        record_lod_error(
+            diagnostics,
+            LODSelectError::FrontierOverflow,
+            level,
+            node,
+            output,
+            frontier_capacity,
+            *next_count
+        );
     }
 }
 
 __global__ void traverse_level_active_kernel(
     int32_t launch_capacity,
+    int32_t frontier_capacity,
+    int32_t level,
     const int32_t *__restrict__ current_count,
     const int32_t *__restrict__ current_frontier,
     int32_t *__restrict__ next_count,
@@ -357,7 +485,8 @@ __global__ void traverse_level_active_kernel(
     int32_t *__restrict__ overflow,
     int32_t *__restrict__ exact_leaf_count,
     int32_t *__restrict__ proxy_count,
-    int32_t *__restrict__ active_ids
+    int32_t *__restrict__ active_ids,
+    int32_t *__restrict__ diagnostics
 )
 {
     const int32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -367,6 +496,19 @@ __global__ void traverse_level_active_kernel(
     }
 
     const int32_t node = current_frontier[index];
+    if(node < 0 || node >= frontier_capacity)
+    {
+        record_lod_error(
+            diagnostics,
+            LODSelectError::InvalidNode,
+            level,
+            node,
+            index,
+            frontier_capacity,
+            *current_count
+        );
+        return;
+    }
     const float x = centers[node * 3];
     const float y = centers[node * 3 + 1];
     const float z = centers[node * 3 + 2];
@@ -394,6 +536,15 @@ __global__ void traverse_level_active_kernel(
         else
         {
             atomicExch(overflow, 1);
+            record_lod_error(
+                diagnostics,
+                LODSelectError::OutputOverflow,
+                level,
+                node,
+                output,
+                active_capacity,
+                0
+            );
         }
         return;
     }
@@ -405,6 +556,15 @@ __global__ void traverse_level_active_kernel(
         if(start64 < 0 || length64 < 0 || start64 + length64 > exact_capacity)
         {
             atomicExch(overflow, 1);
+            record_lod_error(
+                diagnostics,
+                LODSelectError::InvalidLeafRange,
+                level,
+                node,
+                static_cast<int32_t>(start64),
+                exact_capacity,
+                static_cast<int32_t>(length64)
+            );
             return;
         }
         const int32_t length = static_cast<int32_t>(length64);
@@ -421,17 +581,53 @@ __global__ void traverse_level_active_kernel(
         else
         {
             atomicExch(overflow, 1);
+            record_lod_error(
+                diagnostics,
+                LODSelectError::OutputOverflow,
+                level,
+                node,
+                output,
+                active_capacity,
+                length
+            );
         }
         return;
     }
 
     const int32_t left = children[node * 2];
     const int32_t right = children[node * 2 + 1];
-    if(left >= 0 && right >= 0)
+    if(left < 0 || left >= frontier_capacity
+       || right < 0 || right >= frontier_capacity)
     {
-        const int32_t output = atomicAdd(next_count, 2);
+        record_lod_error(
+            diagnostics,
+            LODSelectError::InvalidChild,
+            level,
+            node,
+            left,
+            frontier_capacity,
+            right
+        );
+        return;
+    }
+
+    const int32_t output = atomicAdd(next_count, 2);
+    if(output <= frontier_capacity - 2)
+    {
         next_frontier[output] = left;
         next_frontier[output + 1] = right;
+    }
+    else
+    {
+        record_lod_error(
+            diagnostics,
+            LODSelectError::FrontierOverflow,
+            level,
+            node,
+            output,
+            frontier_capacity,
+            *next_count
+        );
     }
 }
 } // namespace
@@ -499,6 +695,8 @@ void launch_lod_select_topdown_kernels(
         counts.data_ptr<int32_t>(),
         root_ids.const_data_ptr<int32_t>(),
         static_cast<int32_t>(root_count),
+        static_cast<int32_t>(frontier_capacity),
+        counts.data_ptr<int32_t>() + 4,
         K.const_data_ptr<float>(),
         image_width,
         image_height,
@@ -528,6 +726,8 @@ void launch_lod_select_topdown_kernels(
         const int blocks = (launch_capacity + kThreads - 1) / kThreads;
         traverse_level_kernel<<<blocks, kThreads, 0, stream>>>(
             launch_capacity,
+            static_cast<int32_t>(frontier_capacity),
+            level,
             counts.const_data_ptr<int32_t>() + current_slot,
             current_frontier.const_data_ptr<int32_t>(),
             counts.data_ptr<int32_t>() + next_slot,
@@ -550,7 +750,8 @@ void launch_lod_select_topdown_kernels(
             counts.data_ptr<int32_t>() + 2,
             proxy_ids.data_ptr<int32_t>(),
             counts.data_ptr<int32_t>() + 3,
-            leaf_ids.data_ptr<int32_t>()
+            leaf_ids.data_ptr<int32_t>(),
+            counts.data_ptr<int32_t>() + 4
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
@@ -599,6 +800,8 @@ void launch_lod_select_active_topdown_kernels(
         counts.data_ptr<int32_t>(),
         root_ids.const_data_ptr<int32_t>(),
         static_cast<int32_t>(root_count),
+        static_cast<int32_t>(num_nodes),
+        counts.data_ptr<int32_t>() + 6,
         K.const_data_ptr<float>(),
         image_width,
         image_height,
@@ -626,6 +829,8 @@ void launch_lod_select_active_topdown_kernels(
         const int blocks = (capacity + kThreads - 1) / kThreads;
         traverse_level_active_kernel<<<blocks, kThreads, 0, stream>>>(
             capacity,
+            static_cast<int32_t>(num_nodes),
+            level,
             counts.const_data_ptr<int32_t>() + current_slot,
             current.const_data_ptr<int32_t>(),
             counts.data_ptr<int32_t>() + next_slot,
@@ -654,7 +859,8 @@ void launch_lod_select_active_topdown_kernels(
             counts.data_ptr<int32_t>() + 3,
             counts.data_ptr<int32_t>() + 4,
             counts.data_ptr<int32_t>() + 5,
-            active_ids.data_ptr<int32_t>()
+            active_ids.data_ptr<int32_t>(),
+            counts.data_ptr<int32_t>() + 6
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
