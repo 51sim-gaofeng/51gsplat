@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <tuple>
+#include <vector>
 
 class IntersectMTFused;
 
@@ -121,7 +122,10 @@ namespace gaussian_render_inference_scene
         int64_t camera_model = 0,
         const at::optional<at::Tensor> &radial_coeffs = at::nullopt,
         const at::optional<at::Tensor> &active_indices = at::nullopt,
-        double fisheye_max_theta = 0.0
+        double fisheye_max_theta = 0.0,
+        const std::vector<float> &ftheta_coeffs = {},
+        double max_screen_radius = 0.0,
+        double max_screen_radius_dist = 0.0
     );
 
     // ---------------------------------------------------------------------------
@@ -170,7 +174,10 @@ namespace gaussian_render_inference_scene
             int64_t camera_model = 0,
             const at::optional<at::Tensor> &radial_coeffs = at::nullopt,
             const at::optional<at::Tensor> &active_indices = at::nullopt,
-            double fisheye_max_theta = 0.0
+            double fisheye_max_theta = 0.0,
+            const std::vector<float> &ftheta_coeffs = {},
+            double max_screen_radius = 0.0,
+            double max_screen_radius_dist = 0.0
         );
 
         /// Release all GPU resources.

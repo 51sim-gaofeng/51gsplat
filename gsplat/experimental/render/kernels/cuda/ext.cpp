@@ -21,6 +21,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    m.attr("ftheta_screen_cull") = true;
     py::class_<gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer>(m, "GaussianInferenceRenderer")
         .def(
             py::init<const at::Tensor &, const at::Tensor &, const at::Tensor &, int64_t, int64_t>(),
@@ -52,7 +53,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("camera_model")   = static_cast<int64_t>(0),
             py::arg("radial_coeffs")  = py::none(),
             py::arg("active_indices") = py::none(),
-            py::arg("fisheye_max_theta") = 0.0
+            py::arg("fisheye_max_theta") = 0.0,
+            py::arg("ftheta_coeffs") = std::vector<float>{},
+            py::arg("max_screen_radius") = 0.0,
+            py::arg("max_screen_radius_dist") = 0.0
         )
         .def("release", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::release)
         .def("num_gaussians", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::numGaussians)

@@ -39,6 +39,7 @@
 
 // Viewer kernel headers
 #include "Projection.h"
+#include "FThetaProjection.cuh"
 #include "SphericalHarmonics.h"
 #include "IntersectMTFused.h"
 #include "SHCompression.h"
@@ -185,13 +186,46 @@ namespace gaussian_render_inference_scene
         int64_t camera_model,
         const at::optional<at::Tensor> &radial_coeffs,
         const at::optional<at::Tensor> &active_indices,
-        double fisheye_max_theta
+        double fisheye_max_theta,
+        const std::vector<float> &ftheta_coeffs,
+        double max_screen_radius,
+        double max_screen_radius_dist
     )
     {
         // NOTE: No c10::NoGradGuard here -- the Python caller already enforces
         // torch.inference_mode() (via check_inference_grad_mode), so adding a
         // redundant guard would cost ~2 us per frame in thread-local toggles.
         DEVICE_GUARD(scene.means_planar);
+        TORCH_CHECK(camera_model >= 0 && camera_model <= 3, "Unsupported inference camera model");
+        TORCH_CHECK(std::isfinite(max_screen_radius) && max_screen_radius >= 0.0,
+                "max_screen_radius must be finite and nonnegative");
+        TORCH_CHECK(std::isfinite(max_screen_radius_dist), "max_screen_radius_dist must be finite");
+        higs::FThetaCoefficients ftheta;
+        if(camera_model == static_cast<int64_t>(gsplat::CameraModelType::FTHETA))
+        {
+            TORCH_CHECK(ftheta_coeffs.size() == 10, "ftheta_coeffs requires 6 polynomial, 3 linear, max_angle");
+            TORCH_CHECK(!radial_coeffs.has_value(), "ftheta does not support radial_coeffs");
+            for(size_t index = 0; index < ftheta_coeffs.size(); ++index)
+            {
+                TORCH_CHECK(std::isfinite(ftheta_coeffs[index]), "ftheta_coeffs must be finite");
+            }
+            TORCH_CHECK(ftheta_coeffs[0] == 0.f, "Ftheta inference requires a zero constant polynomial term");
+            TORCH_CHECK(ftheta_coeffs[9] > 0.f, "Ftheta max_angle must be positive");
+            TORCH_CHECK(
+                std::abs(ftheta_coeffs[6] - ftheta_coeffs[7] * ftheta_coeffs[8]) >= 1e-8f,
+                "Ftheta linear_cde must be invertible"
+            );
+            std::copy_n(ftheta_coeffs.begin(), 6, ftheta.polynomial);
+            std::copy_n(ftheta_coeffs.begin() + 6, 3, ftheta.linear);
+            ftheta.max_angle = ftheta_coeffs[9];
+            ftheta.max_screen_radius = static_cast<float>(max_screen_radius);
+            ftheta.max_screen_radius_dist = static_cast<float>(max_screen_radius_dist);
+        }
+        else
+        {
+            TORCH_CHECK(ftheta_coeffs.empty(), "ftheta_coeffs requires camera_model=FTHETA");
+            TORCH_CHECK(max_screen_radius == 0.0, "max_screen_radius requires camera_model=FTHETA");
+        }
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
 
         // ---- Validate out_rgbt if provided ----
@@ -365,7 +399,8 @@ namespace gaussian_render_inference_scene
                 active_colors,
                 {},
                 radial_coeffs,
-                static_cast<float>(fisheye_max_theta)
+                static_cast<float>(fisheye_max_theta),
+                ftheta
             );
         }
         else if(state.sh_coeffs_per_channel == 16)
@@ -398,7 +433,8 @@ namespace gaussian_render_inference_scene
                 active_colors,
                 {},
                 radial_coeffs,
-                static_cast<float>(fisheye_max_theta)
+                static_cast<float>(fisheye_max_theta),
+                ftheta
             );
         }
         else if(state.sh_coeffs_per_channel > 0)
@@ -426,7 +462,8 @@ namespace gaussian_render_inference_scene
                     active_means2d,
                     active_depths,
                     active_conics,
-                    {}
+                    {},
+                    ftheta
                 );
                 higs::launch_spherical_harmonics_viewmat_indexed_fwd_kernel(
                     static_cast<int32_t>(sh_degree),
@@ -461,7 +498,8 @@ namespace gaussian_render_inference_scene
                     active_means2d,
                     active_depths,
                     active_conics,
-                    {}
+                    {},
+                    ftheta
                 );
                 higs::launch_spherical_harmonics_viewmat_fwd_kernel(
                     static_cast<int32_t>(sh_degree),
@@ -500,7 +538,8 @@ namespace gaussian_render_inference_scene
                     active_means2d,
                     active_depths,
                     active_conics,
-                    active_colors
+                    active_colors,
+                    ftheta
                 );
                 raster_colors = &active_colors;
             }
@@ -525,7 +564,8 @@ namespace gaussian_render_inference_scene
                     active_means2d,
                     active_depths,
                     active_conics,
-                    {}
+                    {},
+                    ftheta
                 );
                 // colors_packed is already [N, 4] half {R, G, B, 0}
                 raster_colors = &colors_packed;
@@ -619,7 +659,10 @@ namespace gaussian_render_inference_scene
         int64_t camera_model,
         const at::optional<at::Tensor> &radial_coeffs,
         const at::optional<at::Tensor> &active_indices,
-        double fisheye_max_theta
+        double fisheye_max_theta,
+        const std::vector<float> &ftheta_coeffs,
+        double max_screen_radius,
+        double max_screen_radius_dist
     )
     {
         // Use the colors tensor normalized once at construction time (colors_normalized_)
@@ -651,7 +694,10 @@ namespace gaussian_render_inference_scene
             camera_model,
             radial_coeffs,
             active_indices,
-            fisheye_max_theta
+            fisheye_max_theta,
+            ftheta_coeffs,
+            max_screen_radius,
+            max_screen_radius_dist
         );
     }
 

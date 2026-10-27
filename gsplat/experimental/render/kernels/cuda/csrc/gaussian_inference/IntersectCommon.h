@@ -32,6 +32,18 @@
 
 namespace higs
 {
+inline int64_t grow_buffer_capacity(int64_t current, int64_t required)
+{
+    if(current <= 0)
+    {
+        return required;
+    }
+    const int64_t proportional_growth = current / 8;
+    const int64_t growth = proportional_growth > 1024 ? proportional_growth : 1024;
+    const int64_t grown = current + growth;
+    return grown > required ? grown : required;
+}
+
 // compile-time log2
 template<uint32_t N>
 inline constexpr uint32_t FLOOR_LOG2 = N <= 1 ? 0 : 1 + FLOOR_LOG2<N / 2>;

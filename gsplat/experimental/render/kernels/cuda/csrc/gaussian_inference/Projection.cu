@@ -26,6 +26,7 @@
 #include "SHCompression.h"
 #include "Utils.cuh"
 #include "Projection.h"
+#include "FThetaProjection.cuh"
 #include "Utils.h"
 
 namespace higs
@@ -124,6 +125,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
     const float k3,
     const float k4,
     const float fisheye_max_theta,
+    const FThetaCoefficients ftheta_coeffs,
     // outputs
     uint32_t *__restrict__ visible,    // [(B*C*N+31)/32] packed bitfield
     float *__restrict__ means2d,       // [B, C, N, 2]
@@ -286,6 +288,14 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
                 k1, k2, k3, k4, covar2d, mean2d
             );
             break;
+        case CameraModelType::FTHETA:
+            if(!ftheta_project(mean_c, covar_c, ftheta_coeffs, Ks_b[2], Ks_b[5], covar2d, mean2d))
+            {
+                return false;
+            }
+            break;
+        default:
+            return false;
         }
 
         float compensation;
@@ -321,6 +331,15 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
 
         radius_x = ceilf(radius_x);
         radius_y = ceilf(radius_y);
+
+        if(camera_model == CameraModelType::FTHETA
+           && ftheta_coeffs.max_screen_radius > 0.f
+           && (ftheta_coeffs.max_screen_radius_dist <= 0.f
+               || mean_c.z <= ftheta_coeffs.max_screen_radius_dist)
+           && fmaxf(radius_x, radius_y) > ftheta_coeffs.max_screen_radius)
+        {
+            return false;
+        }
 
         // mask out gaussians outside the image region
         if(mean2d.x + radius_x <= 0
@@ -417,7 +436,8 @@ void launch_projection_fwd_kernel(
     at::Tensor means2d,
     at::Tensor depths,
     at::Tensor conics,
-    at::optional<at::Tensor> compensations
+    at::optional<at::Tensor> compensations,
+    const FThetaCoefficients &ftheta_coeffs
 )
 {
     uint32_t N = means.size(-1);
@@ -478,6 +498,7 @@ void launch_projection_fwd_kernel(
         camera_model,
         k1, k2, k3, k4,
         fisheye_max_theta,
+        ftheta_coeffs,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -513,7 +534,8 @@ void launch_projection_indexed_kernel(
     at::Tensor means2d,
     at::Tensor depths,
     at::Tensor conics,
-    const at::optional<at::Tensor> &out_colors
+    const at::optional<at::Tensor> &out_colors,
+    const FThetaCoefficients &ftheta_coeffs
 )
 {
     const uint32_t source_N = means.size(-1);
@@ -562,6 +584,7 @@ void launch_projection_indexed_kernel(
         camera_model,
         k1, k2, k3, k4,
         fisheye_max_theta,
+        ftheta_coeffs,
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -606,7 +629,8 @@ void launch_projection_sh_fused_kernel(
     at::Tensor colors,
     at::optional<at::Tensor> compensations,
     const at::optional<at::Tensor> radial_coeffs,
-    const float fisheye_max_theta
+    const float fisheye_max_theta,
+    const FThetaCoefficients &ftheta_coeffs
 )
 {
     uint32_t source_N = means.size(-1);
@@ -679,6 +703,7 @@ void launch_projection_sh_fused_kernel(
             camera_model,
             k1, k2, k3, k4,
             fisheye_max_theta,
+            ftheta_coeffs,
             vis_ptr,
             means2d_ptr,
             depths_ptr,

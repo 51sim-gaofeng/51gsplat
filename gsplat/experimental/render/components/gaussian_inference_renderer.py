@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 import torch
@@ -52,7 +53,6 @@ _RENDERER_UNSUPPORTED_KWARGS = frozenset(
         "rays",
         "tangential_coeffs",
         "thin_prism_coeffs",
-        "ftheta_coeffs",
         "lidar_coeffs",
         "external_distortion_coeffs",
         "rolling_shutter",
@@ -168,6 +168,9 @@ class GaussianInferenceRenderer:
         radial_coeffs: Optional[Tensor] = None,
         active_indices: Optional[Tensor] = None,
         fisheye_max_theta: float = 0.0,
+        ftheta_coeffs: Optional[Any] = None,
+        max_screen_radius: float = 0.0,
+        max_screen_radius_dist: float = 0.0,
         out: Optional[RenderReturn] = None,
         **kwargs: Any,
     ) -> RenderReturn:
@@ -189,8 +192,18 @@ class GaussianInferenceRenderer:
             Clipping planes.
         radius_clip : float
             Gaussians with projected radius below this are culled.
+        max_screen_radius : float
+            Ftheta only: cull EWA radii above this pixel threshold. Zero disables.
+        max_screen_radius_dist : float
+            Apply maximum-radius culling only at camera-space z <= this distance.
+            Nonpositive values apply the threshold at all distances.
         eps2d : float
             Covariance regularisation epsilon.
+        ftheta_coeffs : FThetaCameraDistortionParameters, optional
+            Required for ``camera_model='ftheta'``. Only ANGLE_TO_PIXELDIST
+            reference polynomials are supported. Uses first-order EWA projection,
+            not UT/3D evaluation. Intrinsic focal lengths are encoded in the
+            polynomial; K supplies the principal point only.
         background : Tensor, optional
             Background color ``[3]`` float32.
         sh_degree : int, optional
@@ -309,6 +322,10 @@ class GaussianInferenceRenderer:
         else:
             camera_model_int = int(camera_model)
 
+        if camera_model_int not in (0, 1, 2, 3):
+            raise ValueError("Inference supports pinhole, ortho, fisheye and ftheta")
+        ftheta_values = self._normalize_ftheta_coeffs(camera_model_int, ftheta_coeffs)
+
         # -- radial_coeffs -------------------------------------------------
         radial_coeffs_t: Optional[Tensor] = None
         if radial_coeffs is not None:
@@ -365,6 +382,10 @@ class GaussianInferenceRenderer:
             radial_coeffs=radial_coeffs_t,
             active_indices=active_indices,
             fisheye_max_theta=float(fisheye_max_theta),
+            **({"ftheta_coeffs": ftheta_values} if ftheta_values else {}),
+            **({"max_screen_radius": float(max_screen_radius),
+                "max_screen_radius_dist": float(max_screen_radius_dist)}
+               if max_screen_radius != 0.0 or max_screen_radius_dist != 0.0 else {}),
         )
 
         # -- Package result ------------------------------------------------
@@ -382,6 +403,37 @@ class GaussianInferenceRenderer:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _supports_ftheta_screen_cull() -> bool:
+        from ..kernels.gaussian_inference_ops import _require_backend
+
+        return bool(getattr(_require_backend(), "ftheta_screen_cull", False))
+
+    @staticmethod
+    def _normalize_ftheta_coeffs(camera_model: int, coeffs: Any) -> list[float]:
+        if camera_model != 3:
+            if coeffs is not None:
+                raise ValueError("ftheta_coeffs requires camera_model='ftheta'")
+            return []
+        if coeffs is None:
+            raise ValueError("camera_model='ftheta' requires ftheta_coeffs")
+        from gsplat.cuda._wrapper import FThetaPolynomialType
+
+        if int(coeffs.reference_poly) != int(FThetaPolynomialType.ANGLE_TO_PIXELDIST):
+            raise ValueError("Ftheta inference requires ANGLE_TO_PIXELDIST reference")
+        polynomial = list(coeffs.angle_to_pixeldist_poly)
+        linear = list(coeffs.linear_cde)
+        if len(polynomial) != 6 or len(linear) != 3:
+            raise ValueError("Ftheta requires 6 polynomial and 3 linear coefficients")
+        values = [float(value) for value in (*polynomial, *linear, coeffs.max_angle)]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Ftheta coefficients must be finite")
+        if values[0] != 0.0:
+            raise ValueError("Ftheta inference requires a zero constant polynomial term")
+        if values[9] <= 0 or abs(values[6] - values[7] * values[8]) < 1e-8:
+            raise ValueError("Ftheta requires positive max_angle and invertible linear_cde")
+        return values
 
     def release(self) -> None:
         """Release all GPU buffers held by the native renderer."""
