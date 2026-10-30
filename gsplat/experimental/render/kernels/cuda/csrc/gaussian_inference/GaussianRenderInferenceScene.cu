@@ -189,7 +189,11 @@ namespace gaussian_render_inference_scene
         double fisheye_max_theta,
         const std::vector<float> &ftheta_coeffs,
         double max_screen_radius,
-        double max_screen_radius_dist
+        double max_screen_radius_dist,
+        double soft_screen_radius,
+        double max_eccentricity,
+        double offscreen_radius,
+        double ecc_clamp
     )
     {
         // NOTE: No c10::NoGradGuard here -- the Python caller already enforces
@@ -224,8 +228,16 @@ namespace gaussian_render_inference_scene
         else
         {
             TORCH_CHECK(ftheta_coeffs.empty(), "ftheta_coeffs requires camera_model=FTHETA");
-            TORCH_CHECK(max_screen_radius == 0.0, "max_screen_radius requires camera_model=FTHETA");
+            ftheta.max_screen_radius = static_cast<float>(max_screen_radius);
+            ftheta.max_screen_radius_dist = static_cast<float>(max_screen_radius_dist);
         }
+        TORCH_CHECK(std::isfinite(soft_screen_radius) && std::isfinite(max_eccentricity)
+                    && std::isfinite(offscreen_radius),
+                "screen cull shape params must be finite");
+        ftheta.soft_screen_radius = static_cast<float>(soft_screen_radius);
+        ftheta.max_eccentricity = static_cast<float>(max_eccentricity);
+        ftheta.offscreen_radius = static_cast<float>(offscreen_radius);
+        ftheta.ecc_clamp = static_cast<float>(ecc_clamp);
         auto opts_h = at::TensorOptions().dtype(at::kHalf).device(scene.means_planar.device());
 
         // ---- Validate out_rgbt if provided ----
@@ -697,7 +709,11 @@ namespace gaussian_render_inference_scene
             fisheye_max_theta,
             ftheta_coeffs,
             max_screen_radius,
-            max_screen_radius_dist
+            max_screen_radius_dist,
+            soft_screen_radius_,
+            max_eccentricity_,
+            offscreen_radius_,
+            ecc_clamp_
         );
     }
 

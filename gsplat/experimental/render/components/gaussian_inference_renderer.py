@@ -411,6 +411,12 @@ class GaussianInferenceRenderer:
         return bool(getattr(_require_backend(), "ftheta_screen_cull", False))
 
     @staticmethod
+    def _supports_any_camera_screen_cull() -> bool:
+        from ..kernels.gaussian_inference_ops import _require_backend
+
+        return bool(getattr(_require_backend(), "any_camera_screen_cull", False))
+
+    @staticmethod
     def _normalize_ftheta_coeffs(camera_model: int, coeffs: Any) -> list[float]:
         if camera_model != 3:
             if coeffs is not None:

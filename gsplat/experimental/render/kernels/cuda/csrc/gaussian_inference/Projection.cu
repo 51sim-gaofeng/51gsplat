@@ -225,7 +225,8 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         // Fisheye field-angle cull + soft fade: past the calibrated FoV the
         // OpenCV coeffs extrapolate and EWA covariance explodes into radial
         // streaks. Cull beyond fisheye_max_theta; fade opacity over the last ~6deg.
-        if(camera_model == CameraModelType::FISHEYE && fisheye_max_theta > 0.f)
+        if((camera_model == CameraModelType::FISHEYE || camera_model == CameraModelType::PINHOLE)
+           && fisheye_max_theta > 0.f)
         {
             const float rho   = sqrtf(mean_c.x * mean_c.x + mean_c.y * mean_c.y);
             const float theta = atan2f(rho, mean_c.z);
@@ -306,7 +307,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         }
 
         // compute the inverse of the 2d covariance
-        const mat2 covar2d_inv = glm::inverse(covar2d);
+        mat2 covar2d_inv;
 
         float extend = MAX_EXTEND;
         if(compensations != nullptr)
@@ -318,6 +319,49 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
             return false;
         }
         extend = min(extend, sqrt(2.0f * __logf(opacity / ALPHA_THRESHOLD)));
+
+        if(ftheta_coeffs.max_eccentricity > 0.f
+           && (ftheta_coeffs.max_screen_radius_dist <= 0.f
+               || mean_c.z <= ftheta_coeffs.max_screen_radius_dist))
+        {
+            // Principal axes of the 2D ellipse (axis-aligned bbox misses diagonal streaks).
+            const float a      = covar2d[0][0];
+            const float b      = covar2d[0][1];
+            const float c      = covar2d[1][1];
+            const float mid    = 0.5f * (a + c);
+            const float disc   = sqrtf(fmaxf(mid * mid - det, 0.f));
+            const float l_max  = mid + disc;
+            const float l_min  = fmaxf(mid - disc, 1e-12f);
+            const float ecc2   = ftheta_coeffs.max_eccentricity * ftheta_coeffs.max_eccentricity;
+            if(extend * sqrtf(l_max) > ftheta_coeffs.soft_screen_radius && l_max > ecc2 * l_min)
+            {
+                if(ftheta_coeffs.ecc_clamp <= 0.f)
+                {
+                    return false;
+                }
+                // Shrink only the major axis so the splat stays in place (no hole, no streak).
+                float vx, vy;
+                if(fabsf(b) > 1e-12f)
+                {
+                    vx = b;
+                    vy = l_max - a;
+                }
+                else
+                {
+                    vx = a >= c ? 1.f : 0.f;
+                    vy = a >= c ? 0.f : 1.f;
+                }
+                const float inv_n = rsqrtf(vx * vx + vy * vy);
+                vx *= inv_n;
+                vy *= inv_n;
+                const float dl = ecc2 * l_min - l_min;
+                covar2d[0][0] = l_min + dl * vx * vx;
+                covar2d[1][1] = l_min + dl * vy * vy;
+                covar2d[0][1] = dl * vx * vy;
+                covar2d[1][0] = covar2d[0][1];
+            }
+        }
+        covar2d_inv = glm::inverse(covar2d);
 
         // compute tight rectangular bounding box
         float radius_x = extend * sqrtf(covar2d[0][0]);
@@ -332,11 +376,19 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         radius_x = ceilf(radius_x);
         radius_y = ceilf(radius_y);
 
-        if(camera_model == CameraModelType::FTHETA
-           && ftheta_coeffs.max_screen_radius > 0.f
+        // Per-frame EWA screen-radius cull; fields default to 0 (off) for all camera models.
+        if(ftheta_coeffs.max_screen_radius > 0.f
            && (ftheta_coeffs.max_screen_radius_dist <= 0.f
                || mean_c.z <= ftheta_coeffs.max_screen_radius_dist)
            && fmaxf(radius_x, radius_y) > ftheta_coeffs.max_screen_radius)
+        {
+            return false;
+        }
+
+        // Off-screen-centre splats bleeding in with large EWA extent (radial streaks at wide FoV edges).
+        if(ftheta_coeffs.offscreen_radius > 0.f
+           && (mean2d.x < 0.f || mean2d.x >= image_width || mean2d.y < 0.f || mean2d.y >= image_height)
+           && fmaxf(radius_x, radius_y) > ftheta_coeffs.offscreen_radius)
         {
             return false;
         }

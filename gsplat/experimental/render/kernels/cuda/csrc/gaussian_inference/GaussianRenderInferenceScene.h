@@ -125,7 +125,11 @@ namespace gaussian_render_inference_scene
         double fisheye_max_theta = 0.0,
         const std::vector<float> &ftheta_coeffs = {},
         double max_screen_radius = 0.0,
-        double max_screen_radius_dist = 0.0
+        double max_screen_radius_dist = 0.0,
+        double soft_screen_radius = 0.0,
+        double max_eccentricity = 0.0,
+        double offscreen_radius = 0.0,
+        double ecc_clamp = 0.0
     );
 
     // ---------------------------------------------------------------------------
@@ -183,6 +187,16 @@ namespace gaussian_render_inference_scene
         /// Release all GPU resources.
         void release();
 
+        /// Elongated-splat cull applied on subsequent render() calls; 0 disables.
+        void setScreenCullShape(double soft_screen_radius, double max_eccentricity, double offscreen_radius,
+                                double ecc_clamp)
+        {
+            soft_screen_radius_ = soft_screen_radius;
+            max_eccentricity_   = max_eccentricity;
+            offscreen_radius_   = offscreen_radius;
+            ecc_clamp_          = ecc_clamp;
+        }
+
         /// Number of gaussians in the loaded scene (0 after release).
         uint32_t numGaussians() const
         {
@@ -197,6 +211,10 @@ namespace gaussian_render_inference_scene
 
     private:
         std::unique_ptr<InferenceRenderState> state_;
+        double soft_screen_radius_ = 0.0;
+        double max_eccentricity_   = 0.0;
+        double offscreen_radius_   = 0.0;
+        double ecc_clamp_          = 0.0;
         at::Tensor colors_normalized_; // cached [N,K,3] view (avoids per-frame reshape)
     };
 

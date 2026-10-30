@@ -11,6 +11,11 @@ struct FThetaCoefficients
     float max_angle = 0.f;
     float max_screen_radius = 0.f;
     float max_screen_radius_dist = 0.f;
+    // Elongated-splat cull: major axis > soft_screen_radius AND major/minor > max_eccentricity.
+    float soft_screen_radius = 0.f;
+    float max_eccentricity = 0.f;
+    float offscreen_radius = 0.f;
+    float ecc_clamp = 0.f;  // >0: shrink major axis instead of culling eccentric splats
 };
 
 inline __device__ bool ftheta_project(

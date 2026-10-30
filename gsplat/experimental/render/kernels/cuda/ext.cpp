@@ -22,6 +22,10 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.attr("ftheta_screen_cull") = true;
+    m.attr("any_camera_screen_cull") = true;
+    m.attr("screen_cull_shape") = true;
+    m.attr("pinhole_field_cull") = true;
+    m.attr("ecc_clamp") = true;
     py::class_<gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer>(m, "GaussianInferenceRenderer")
         .def(
             py::init<const at::Tensor &, const at::Tensor &, const at::Tensor &, int64_t, int64_t>(),
@@ -59,6 +63,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("max_screen_radius_dist") = 0.0
         )
         .def("release", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::release)
+        .def(
+            "set_screen_cull_shape",
+            &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::setScreenCullShape,
+            py::arg("soft_screen_radius"),
+            py::arg("max_eccentricity"),
+            py::arg("offscreen_radius") = 0.0,
+            py::arg("ecc_clamp") = 0.0
+        )
         .def("num_gaussians", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::numGaussians)
         .def("is_released", &gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer::isReleased);
 }
