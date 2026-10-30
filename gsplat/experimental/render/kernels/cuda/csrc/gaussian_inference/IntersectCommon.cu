@@ -357,12 +357,11 @@ void launch_mt_chunk_bases(
     int64_t cap = inout_scratch_capacity ? *inout_scratch_capacity : 0;
     if(required > cap)
     {
-        const int64_t new_capacity = grow_buffer_capacity(cap, required);
-        block_sums     = at::empty({new_capacity}, opts_i32);
-        block_prefixes = at::empty({new_capacity}, opts_i32);
+        block_sums     = at::empty({required}, opts_i32);
+        block_prefixes = at::empty({required}, opts_i32);
         if(inout_scratch_capacity)
         {
-            *inout_scratch_capacity = new_capacity;
+            *inout_scratch_capacity = required;
         }
     }
 
