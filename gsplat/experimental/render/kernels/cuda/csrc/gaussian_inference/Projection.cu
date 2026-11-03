@@ -99,6 +99,99 @@ inline __device__ void fisheye_proj_distorted(
     cov2d = J * cov3d * glm::transpose(J);
 }
 
+// OpenCV Brown-Conrady pinhole distortion (radial k1..k6 rational + tangential p1,p2),
+// applied directly in the projection kernel so distorted images render in one pass
+// (no wide-FoV pinhole intermediate + reverse warp). Mirrors fisheye_proj_distorted:
+// forward-projects the mean and transforms the 3D covariance by the analytic Jacobian.
+// With all coeffs == 0 this reduces exactly to gsplat::persp_proj.
+inline __device__ bool opencv_proj_distorted(
+    const vec3 mean3d,
+    const mat3 cov3d,
+    const float fx,
+    const float fy,
+    const float cx,
+    const float cy,
+    const float k1,
+    const float k2,
+    const float k3,
+    const float k4,
+    const float k5,
+    const float k6,
+    const float p1,
+    const float p2,
+    const float r2_max,
+    const float r_knee,
+    const float rd_knee,
+    const float slope_knee,
+    mat2 &cov2d,
+    vec2 &mean2d)
+{
+    const float z = mean3d[2];
+    if(z <= 1e-6f)
+    {
+        return false;
+    }
+    const float inv_z = 1.f / z;
+    const float a = mean3d[0] * inv_z;   // normalized image coords
+    const float b = mean3d[1] * inv_z;
+    const float r2 = a * a + b * b;
+    // Like ftheta max_angle: past the monotonic region the rational model folds back /
+    // hits a pole, mapping far-off-axis splats into the image with exploding covariance.
+    if(r2 > r2_max)
+    {
+        return false;
+    }
+
+    float radial;
+    float dR;  // d(radial)/d(r2)
+    if(r_knee > 0.f && r2 > r_knee * r_knee)
+    {
+        // Linear continuation r_d = rd_knee + slope*(r - r_knee): C1 with the calibrated model.
+        const float r  = sqrtf(r2);
+        const float rd = rd_knee + slope_knee * (r - r_knee);
+        radial = rd / r;
+        dR     = (slope_knee - radial) / (2.f * r2);
+    }
+    else
+    {
+        const float num = 1.f + r2 * (k1 + r2 * (k2 + r2 * k3));
+        const float den = 1.f + r2 * (k4 + r2 * (k5 + r2 * k6));
+        if(den <= 1e-6f)
+        {
+            return false;
+        }
+        const float inv_den = 1.f / den;
+        radial = num * inv_den;
+        const float dnum = k1 + r2 * (2.f * k2 + 3.f * k3 * r2);
+        const float dden = k4 + r2 * (2.f * k5 + 3.f * k6 * r2);
+        dR = (dnum * den - num * dden) * inv_den * inv_den;
+    }
+
+    // tangential + distorted normalized coords
+    const float ab = a * b;
+    const float xd = a * radial + 2.f * p1 * ab + p2 * (r2 + 2.f * a * a);
+    const float yd = b * radial + p1 * (r2 + 2.f * b * b) + 2.f * p2 * ab;
+    mean2d = vec2({fx * xd + cx, fy * yd + cy});
+
+    // Full distortion Jacobian D = d(xd,yd)/d(a,b); isotropic fx*radial over-widens splats radially.
+    const float d00 = radial + 2.f * a * a * dR + 2.f * p1 * b + 6.f * p2 * a;
+    const float d01 = 2.f * a * b * dR + 2.f * p1 * a + 2.f * p2 * b;
+    const float d10 = 2.f * a * b * dR + 2.f * p1 * a + 2.f * p2 * b;
+    const float d11 = radial + 2.f * b * b * dR + 6.f * p1 * b + 2.f * p2 * a;
+    // J = diag(fx,fy) * D * [[1/z,0,-a/z],[0,1/z,-b/z]]  (glm column-major)
+    const float j00 = fx * d00 * inv_z, j01 = fx * d01 * inv_z;
+    const float j10 = fy * d10 * inv_z, j11 = fy * d11 * inv_z;
+    glm::mat3x2 J = glm::mat3x2(
+        j00, j10,
+        j01, j11,
+        -(j00 * a + j01 * b), -(j10 * a + j11 * b)
+    );
+    cov2d = J * cov3d * glm::transpose(J);
+    return isfinite(mean2d.x) && isfinite(mean2d.y)
+        && isfinite(cov2d[0][0]) && isfinite(cov2d[0][1]) && isfinite(cov2d[1][1]);
+}
+
+
 template<bool FUSE_SH, SHInputMode SH_MODE = SHInputMode::RAW_HALF>
 __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MIN_BLOCKS) projection_fwd_kernel(
     const uint32_t B,
@@ -126,6 +219,7 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
     const float k4,
     const float fisheye_max_theta,
     const FThetaCoefficients ftheta_coeffs,
+    const OpenCVDistortion opencv,
     // outputs
     uint32_t *__restrict__ visible,    // [(B*C*N+31)/32] packed bitfield
     float *__restrict__ means2d,       // [B, C, N, 2]
@@ -274,9 +368,23 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         switch(camera_model)
         {
         case CameraModelType::PINHOLE:
-            gsplat::persp_proj(
-                mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5], image_width, image_height, covar2d, mean2d
-            );
+            if(opencv.active)
+            {
+                if(!opencv_proj_distorted(
+                       mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5],
+                       opencv.k[0], opencv.k[1], opencv.k[2], opencv.k[3], opencv.k[4], opencv.k[5],
+                       opencv.p[0], opencv.p[1], opencv.r2_max,
+                       opencv.r_knee, opencv.rd_knee, opencv.slope_knee, covar2d, mean2d))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                gsplat::persp_proj(
+                    mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5], image_width, image_height, covar2d, mean2d
+                );
+            }
             break;
         case CameraModelType::ORTHO:
             gsplat::ortho_proj(
@@ -467,6 +575,87 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
 // Launch wrappers
 // ============================================================
 
+// Build OpenCV Brown-Conrady distortion from radial_coeffs for PINHOLE cameras.
+// Layout (shared with fisheye's radial_coeffs): [k1,k2,k3,k4,k5,k6, p1,p2]. Needs >=6
+// elements to activate; p1,p2 default 0 when absent. Non-pinhole -> inactive.
+static inline OpenCVDistortion build_opencv_distortion(
+    const at::optional<at::Tensor> &radial_coeffs,
+    const gsplat::CameraModelType camera_model)
+{
+    OpenCVDistortion d;
+    if(camera_model != gsplat::CameraModelType::PINHOLE || !radial_coeffs.has_value())
+    {
+        return d;
+    }
+    const auto rc = radial_coeffs.value().to(at::kCPU).to(at::kFloat).contiguous();
+    const int64_t n = rc.numel();
+    if(n < 6)
+    {
+        return d;
+    }
+    const float *p = rc.data_ptr<float>();
+    for(int i = 0; i < 6; ++i)
+    {
+        d.k[i] = p[i];
+    }
+    d.p[0] = n >= 7 ? p[6] : 0.f;
+    d.p[1] = n >= 8 ? p[7] : 0.f;
+    bool any = d.p[0] != 0.f || d.p[1] != 0.f;
+    for(int i = 0; i < 6; ++i)
+    {
+        any = any || d.k[i] != 0.f;
+    }
+    d.active = any;
+    // First r where r_d(r) = r*num/den stops increasing (same search as Python pinhole mask).
+    // Instead of culling past it, continue r_d linearly from a knee at kKneeFrac * r_limit with
+    // the calibrated slope there, so corner pixels beyond the fold still get real geometry.
+    // Must stay in sync with utils/common/opencv_distortion.py::opencv_extension().
+    if(any)
+    {
+        constexpr int kSteps = 8000;
+        constexpr double kRmax = 8.0;
+        constexpr double kKneeFrac = 0.95;
+        // Extend only far enough to cover image corners (r_d up to kExtendRdFrac * fold r_d);
+        // splats past that stay culled, otherwise huge near-90deg splats beside the camera
+        // project across the whole frame.
+        constexpr double kExtendRdFrac = 1.15;
+        auto rd_of = [&](double r) {
+            const double r2  = r * r;
+            const double num = 1.0 + r2 * (d.k[0] + r2 * (d.k[1] + r2 * d.k[2]));
+            const double den = 1.0 + r2 * (d.k[3] + r2 * (d.k[4] + r2 * d.k[5]));
+            return den > 1e-9 ? r * num / den : -1.0;
+        };
+        double prev = 0.0;
+        for(int s = 1; s <= kSteps; ++s)
+        {
+            const double r  = kRmax * s / kSteps;
+            const double rd = rd_of(r);
+            if(rd <= prev)
+            {
+                const double r_limit = kRmax * (s - 1) / kSteps;
+                const double r_knee  = kKneeFrac * r_limit;
+                const double h       = 1e-4 * r_limit;
+                const double slope   = (rd_of(r_knee + h) - rd_of(r_knee - h)) / (2.0 * h);
+                if(r_knee > 0.0 && slope > 0.0)
+                {
+                    d.r_knee     = static_cast<float>(r_knee);
+                    d.rd_knee    = static_cast<float>(rd_of(r_knee));
+                    d.slope_knee = static_cast<float>(slope);
+                    const double r_cap = r_knee + (kExtendRdFrac * prev - rd_of(r_knee)) / slope;
+                    d.r2_max = static_cast<float>(r_cap * r_cap);
+                }
+                else
+                {
+                    d.r2_max = static_cast<float>(r_limit * r_limit);
+                }
+                break;
+            }
+            prev = rd;
+        }
+    }
+    return d;
+}
+
 void launch_projection_fwd_kernel(
     // inputs
     const at::Tensor means,
@@ -551,6 +740,7 @@ void launch_projection_fwd_kernel(
         k1, k2, k3, k4,
         fisheye_max_theta,
         ftheta_coeffs,
+        build_opencv_distortion(radial_coeffs, camera_model),
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -637,6 +827,7 @@ void launch_projection_indexed_kernel(
         k1, k2, k3, k4,
         fisheye_max_theta,
         ftheta_coeffs,
+        build_opencv_distortion(radial_coeffs, camera_model),
         reinterpret_cast<uint32_t *>(visible.data_ptr<int32_t>()),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),
@@ -756,6 +947,7 @@ void launch_projection_sh_fused_kernel(
             k1, k2, k3, k4,
             fisheye_max_theta,
             ftheta_coeffs,
+            build_opencv_distortion(radial_coeffs, camera_model),
             vis_ptr,
             means2d_ptr,
             depths_ptr,

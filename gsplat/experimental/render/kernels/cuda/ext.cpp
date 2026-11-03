@@ -26,6 +26,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("screen_cull_shape") = true;
     m.attr("pinhole_field_cull") = true;
     m.attr("ecc_clamp") = true;
+    m.attr("opencv_pinhole_distortion") = true;
+    m.attr("opencv_pinhole_distortion_extended") = true;
     py::class_<gsplat::gaussian_render_inference_scene::GaussianInferenceRenderer>(m, "GaussianInferenceRenderer")
         .def(
             py::init<const at::Tensor &, const at::Tensor &, const at::Tensor &, int64_t, int64_t>(),

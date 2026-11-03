@@ -343,9 +343,17 @@ class GaussianInferenceRenderer:
                     f"radial_coeffs must have at least 4 elements (k1..k4); "
                     f"got {radial_coeffs_t.numel()}"
                 )
-            if camera_model_int != _CAMERA_MODEL_STR_TO_INT["fisheye"]:
+            # fisheye: 4-coeff radial; pinhole: OpenCV Brown-Conrady [k1..k6,p1,p2] (>=6).
+            _fisheye = _CAMERA_MODEL_STR_TO_INT["fisheye"]
+            _pinhole = _CAMERA_MODEL_STR_TO_INT["pinhole"]
+            if camera_model_int not in (_fisheye, _pinhole):
                 raise ValueError(
-                    "radial_coeffs only supported with camera_model='fisheye'"
+                    "radial_coeffs only supported with camera_model='fisheye' or 'pinhole'"
+                )
+            if camera_model_int == _pinhole and radial_coeffs_t.numel() < 6:
+                raise ValueError(
+                    "pinhole radial_coeffs (OpenCV k1..k6[,p1,p2]) need >=6 elements; "
+                    f"got {radial_coeffs_t.numel()}"
                 )
 
         # -- Validate out buffer -------------------------------------------

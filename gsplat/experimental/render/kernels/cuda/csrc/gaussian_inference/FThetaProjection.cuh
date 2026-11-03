@@ -2,7 +2,17 @@
 
 #include "Common.h"
 
-namespace higs
+
+
+// OpenCV Brown-Conrady pinhole distortion coefficients (radial k1..k6 + tangential p1,p2),
+// passed by value into the projection kernel. active=false -> plain persp_proj.
+struct OpenCVDistortion
+{
+    float k[6]{};
+    float p[2]{};
+    float r2_max = 1e30f;  // undistorted r^2 limit of the monotonic (valid) mapping region
+    // C1 linear extension of r_d(r) beyond r_knee (just inside the monotonic limit), so the
+    // whole image maps to real rays instead of cunamespace higs
 {
 struct FThetaCoefficients
 {
@@ -16,6 +26,11 @@ struct FThetaCoefficients
     float max_eccentricity = 0.f;
     float offscreen_radius = 0.f;
     float ecc_clamp = 0.f;  // >0: shrink major axis instead of culling eccentric splats
+};lling past the limit. r_knee <= 0 -> off.
+    float r_knee = 0.f;
+    float rd_knee = 0.f;
+    float slope_knee = 0.f;
+    bool  active = false;
 };
 
 inline __device__ bool ftheta_project(
