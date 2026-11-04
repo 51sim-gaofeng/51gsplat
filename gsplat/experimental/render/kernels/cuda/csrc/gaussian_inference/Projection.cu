@@ -101,6 +101,8 @@ inline __device__ void fisheye_proj_distorted(
 
 // Radial factor r_d/r of the (C1-extended) rational model and d(radial)/d(r2).
 // Returns false at a pole of the rational model.
+// persp_proj's lim = 1.3 * tan_fov (edge + 0.3*tan_fov); same factor, undistorted space.
+constexpr float kFovCullFrac = 1.3f;
 inline __device__ bool opencv_radial(
     const float r2,
     const float k1,
@@ -162,7 +164,7 @@ inline __device__ bool opencv_proj_distorted(
     const float r_knee,
     const float rd_knee,
     const float slope_knee,
-    const float rd_clamp,
+    const float rd_corner,
     mat2 &cov2d,
     vec2 &mean2d)
 {
@@ -195,17 +197,17 @@ inline __device__ bool opencv_proj_distorted(
     const float yd = b * radial + p1 * (r2 + 2.f * b * b) + 2.f * p2 * ab;
     mean2d = vec2({fx * xd + cx, fy * yd + cy});
 
-    // Jacobian clamp (counterpart of persp_proj's lim_x/lim_y): the EWA footprint grows with
-    // x/z, so far off-screen splats beside the camera would smear across the whole frame —
-    // e.g. narrow-FoV cameras whose distortion never folds back, where r2_max culls nothing.
-    // Evaluate the Jacobian where the ray crosses r_d == rd_clamp instead; on-screen splats
-    // (r_d <= rd_clamp) are unaffected and mean2d always stays exact.
-    float ja = a;
-    float jb = b;
+    // FoV cull (counterpart of persp_proj's lim_x/lim_y = 1.3 * tan_fov). The limit lives in
+    // *undistorted* space: r_lim = 1.3 * r_u(corner), r_u(corner) being the undistorted radius
+    // whose distorted radius reaches the farthest image corner (== rd_corner without distortion).
+    // Past it persp_proj would put the mean far off-screen, but a saturating lens squeezes
+    // everything up to ~90deg into a thin ring just outside the corner, where near-camera splats
+    // smear across the frame (unclamped Jacobian) or pile up into an edge haze (clamped one).
+    // A distorted-space limit is useless there (r_d just past the corner already means ~90deg).
     const float r = sqrtf(r2);
-    if(rd_clamp > 0.f && r * radial > rd_clamp)
+    if(rd_corner > 0.f && r * radial > rd_corner)
     {
-        // r_d(r) is monotonic on [0, r] (r2 <= r2_max), so bisection finds the crossing.
+        // r_d(r) is monotonic on [0, r] (r2 <= r2_max), so bisection finds the corner crossing.
         float lo = 0.f;
         float hi = r;
         for(int i = 0; i < 24; ++i)
@@ -213,7 +215,7 @@ inline __device__ bool opencv_proj_distorted(
             const float mid = 0.5f * (lo + hi);
             float radial_mid, dR_mid;
             if(opencv_radial(mid * mid, k1, k2, k3, k4, k5, k6, r_knee, rd_knee, slope_knee, radial_mid, dR_mid)
-               && mid * radial_mid < rd_clamp)
+               && mid * radial_mid < rd_corner)
             {
                 lo = mid;
             }
@@ -222,27 +224,24 @@ inline __device__ bool opencv_proj_distorted(
                 hi = mid;
             }
         }
-        const float s = lo / r;
-        ja = a * s;
-        jb = b * s;
-        if(!opencv_radial(ja * ja + jb * jb, k1, k2, k3, k4, k5, k6, r_knee, rd_knee, slope_knee, radial, dR))
+        if(r > kFovCullFrac * lo)
         {
             return false;
         }
     }
 
     // Full distortion Jacobian D = d(xd,yd)/d(a,b); isotropic fx*radial over-widens splats radially.
-    const float d00 = radial + 2.f * ja * ja * dR + 2.f * p1 * jb + 6.f * p2 * ja;
-    const float d01 = 2.f * ja * jb * dR + 2.f * p1 * ja + 2.f * p2 * jb;
-    const float d10 = 2.f * ja * jb * dR + 2.f * p1 * ja + 2.f * p2 * jb;
-    const float d11 = radial + 2.f * jb * jb * dR + 6.f * p1 * jb + 2.f * p2 * ja;
+    const float d00 = radial + 2.f * a * a * dR + 2.f * p1 * b + 6.f * p2 * a;
+    const float d01 = 2.f * a * b * dR + 2.f * p1 * a + 2.f * p2 * b;
+    const float d10 = 2.f * a * b * dR + 2.f * p1 * a + 2.f * p2 * b;
+    const float d11 = radial + 2.f * b * b * dR + 6.f * p1 * b + 2.f * p2 * a;
     // J = diag(fx,fy) * D * [[1/z,0,-a/z],[0,1/z,-b/z]]  (glm column-major)
     const float j00 = fx * d00 * inv_z, j01 = fx * d01 * inv_z;
     const float j10 = fy * d10 * inv_z, j11 = fy * d11 * inv_z;
     glm::mat3x2 J = glm::mat3x2(
         j00, j10,
         j01, j11,
-        -(j00 * ja + j01 * jb), -(j10 * ja + j11 * jb)
+        -(j00 * a + j01 * b), -(j10 * a + j11 * b)
     );
     cov2d = J * cov3d * glm::transpose(J);
     return isfinite(mean2d.x) && isfinite(mean2d.y)
@@ -428,15 +427,16 @@ __global__ void __launch_bounds__(CTA_SIZE, FUSE_SH ? FUSED_MIN_BLOCKS : PROJ_MI
         case CameraModelType::PINHOLE:
             if(opencv.active)
             {
-                // 1.3x the distorted normalized corner radius ~ persp_proj's edge + 0.3*tan_fov margin.
+                // Distorted normalized radius of the farthest image corner; the kernel turns it
+                // into an undistorted Jacobian limit (see opencv_proj_distorted).
                 const float ex = fmaxf(Ks_b[2], static_cast<float>(image_width) - Ks_b[2]) / Ks_b[0];
                 const float ey = fmaxf(Ks_b[5], static_cast<float>(image_height) - Ks_b[5]) / Ks_b[4];
-                const float rd_clamp = 1.3f * sqrtf(ex * ex + ey * ey);
+                const float rd_corner = sqrtf(ex * ex + ey * ey);
                 if(!opencv_proj_distorted(
                        mean_c, covar_c, Ks_b[0], Ks_b[4], Ks_b[2], Ks_b[5],
                        opencv.k[0], opencv.k[1], opencv.k[2], opencv.k[3], opencv.k[4], opencv.k[5],
                        opencv.p[0], opencv.p[1], opencv.r2_max,
-                       opencv.r_knee, opencv.rd_knee, opencv.slope_knee, rd_clamp, covar2d, mean2d))
+                       opencv.r_knee, opencv.rd_knee, opencv.slope_knee, rd_corner, covar2d, mean2d))
                 {
                     return false;
                 }
