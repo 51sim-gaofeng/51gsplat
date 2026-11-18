@@ -48,8 +48,11 @@ Limitations (kept intentionally simple):
 from __future__ import annotations
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from functools import lru_cache
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -148,6 +151,7 @@ __all__ = [
     "OctreeNode",
     "build_octree_lod",
     "build_bvh_lod",
+    "build_bvh_lod_batched",
     "select_lod",
     "save_lod_cache",
     "load_lod_cache",
@@ -796,6 +800,7 @@ def _build_bvh_lod_cuda_flat(
     max_depth: int,
     min_points_per_node: int,
     opacity_mode: str,
+    retain_root_stats: bool = False,
 ):
     """Build the median-split hierarchy entirely as flat CUDA tensors."""
     device = means.device
@@ -1116,7 +1121,385 @@ def _build_bvh_lod_cuda_flat(
     root._flat_leaf_colors = exact_colors
     root._num_nodes = num_nodes
     root._leaf_index_device = device
+    if retain_root_stats:
+        # Keep unquantized moments, not the fp16 proxy, when joining subtrees.
+        root._build_root_stats = tuple(
+            tensor[:1].detach().cpu().clone()
+            for tensor in (
+                node_weights, node_means, node_covars, node_colors,
+                node_alpha, node_mass,
+            )
+        )
     _cast_flat_fp16(root)
+    return root
+
+
+def _bvh_build_vram_budget(device) -> int:
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    reusable = (
+        torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    )
+    available = free_bytes + reusable
+    return max(0, available - max(512 * 2**20, available // 5))
+
+
+@torch.no_grad()
+def build_bvh_lod_batched(
+    means: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+    opacities: Tensor,
+    colors: Tensor,
+    max_depth: int = 32,
+    min_points_per_node: int = 64,
+    opacity_mode: str = "union",
+    *,
+    max_points_per_batch: int = 0,
+    cpu_workers: int = 0,
+    device: str = "cuda",
+    progress: Optional[Callable[[int, int], None]] = None,
+):
+    """Build one ordinary flat BVH with CPU storage and bounded CUDA batches.
+
+    Upper levels use the same longest-axis, stable median splits as the
+    CUDA builder. Their frontier subtrees are built sequentially on CUDA and
+    copied into one preallocated CPU cache in preorder. No pages, streaming
+    format, point sampling, or additional proxy quantization is introduced.
+    Host storage remains O(N); GPU working storage is O(max_points_per_batch).
+    A zero batch limit chooses a conservative limit from available VRAM. A
+    zero worker count uses up to eight CPU workers for independent upper splits.
+    """
+    inputs = (means, quats, scales, opacities, colors)
+    n = means.shape[0]
+    if any(t.device.type != "cpu" or t.dtype != torch.float32 for t in inputs):
+        raise ValueError("batched BVH inputs must be CPU float32 tensors")
+    expected = ((n, 3), (n, 4), (n, 3), (n,))
+    if any(t.shape != shape for t, shape in zip(inputs, expected)):
+        raise ValueError("inconsistent BVH geometry/opacity shapes")
+    if colors.ndim < 2 or colors.shape[0] != n or colors.shape[-1] != 3:
+        raise ValueError("colors must have shape [N, ..., 3]")
+    if n == 0 or max_depth < 0 or min_points_per_node < 1:
+        raise ValueError("BVH requires points, nonnegative depth and positive leaf size")
+    if opacity_mode not in ("union", "mass"):
+        raise ValueError(f"unsupported opacity_mode: {opacity_mode!r}")
+    if max_points_per_batch < 0 or cpu_workers < 0:
+        raise ValueError("batch limit and CPU worker count must be nonnegative")
+    target = torch.device(device)
+    if target.type != "cuda":
+        raise ValueError("batched BVH requires a CUDA build device")
+    auto_batch = max_points_per_batch == 0
+    if auto_batch:
+        budget = _bvh_build_vram_budget(target)
+        if budget <= 0:
+            raise RuntimeError("insufficient free VRAM for automatic BVH batching")
+        # Account for point scratch, appearance copies, and worst-case node
+        # density of a median tree; leave 20% (at least 512 MiB) uncommitted.
+        appearance_bytes = colors[0].numel() * colors.element_size()
+        node_ratio = min(2.0, 4.0 / min_points_per_node)
+        bytes_per_point = (
+            512 + 2 * appearance_bytes
+            + node_ratio * (256 + 3 * appearance_bytes)
+        )
+        max_points_per_batch = max(1, int(budget / bytes_per_point))
+    cpu_workers = cpu_workers or min(8, os.cpu_count() or 1)
+    largest_leaf = n
+    for _ in range(max_depth):
+        if largest_leaf <= min_points_per_node:
+            break
+        largest_leaf = (largest_leaf + 1) // 2
+    if largest_leaf > max_points_per_batch:
+        raise ValueError(
+            f"largest leaf ({largest_leaf} points) exceeds the batch limit "
+            f"({max_points_per_batch}); increase max_depth or the batch limit"
+        )
+
+    @lru_cache(maxsize=None)
+    def tree_size(count, depth):
+        if depth == max_depth or count <= min_points_per_node:
+            return 1
+        half = count // 2
+        return 1 + tree_size(half, depth + 1) + tree_size(count - half, depth + 1)
+
+    num_nodes = tree_size(n, 0)
+    root = _CachedLODRoot()
+    root._build_batch_points = max_points_per_batch
+    root._build_cpu_workers = cpu_workers
+    root._num_nodes = num_nodes
+    root._leaf_index_device = torch.device("cpu")
+    root._node_center = torch.empty((num_nodes, 3), dtype=torch.float32, device="cpu")
+    root._node_radius = torch.empty(num_nodes, dtype=torch.float32, device="cpu")
+    root._node_size = root._node_radius
+    root._node_is_leaf = torch.empty(num_nodes, dtype=torch.bool, device="cpu")
+    root._node_parent = torch.empty(num_nodes, dtype=torch.long, device="cpu")
+    root._node_leaf_start = torch.zeros(num_nodes, dtype=torch.long, device="cpu")
+    root._node_leaf_len = torch.zeros(num_nodes, dtype=torch.long, device="cpu")
+    for kind, count in (("leaf", n), ("proxy", num_nodes)):
+        for name, tensor in zip(
+            ("means", "quats", "scales", "opacities", "colors"), inputs
+        ):
+            dtype = torch.float32 if name == "means" else torch.float16
+            setattr(
+                root, f"_flat_{kind}_{name}",
+                torch.empty((count,) + tensor.shape[1:], dtype=dtype, device="cpu"),
+            )
+    xyz = means.detach().numpy()
+    indices = np.arange(n, dtype=np.uint32 if n < 2**32 else np.int64)
+    completed = 0
+
+    subtree_timings = {
+        "batch_gather_cpu": 0.0,
+        "batch_prefetch_wait": 0.0,
+        "batch_upload_gpu": 0.0,
+        "batch_build_gpu": 0.0,
+        "batch_download_gpu": 0.0,
+        "batch_output_cpu": 0.0,
+    }
+
+    @torch.no_grad()
+    def prepare_batch(descriptor, buffer):
+        started = time.perf_counter()
+        ids = descriptor[0]
+        gather = torch.from_numpy(ids.astype(np.int64))
+        offset = 0
+        prepared = []
+        for tensor in inputs:
+            shape = (len(ids),) + tensor.shape[1:]
+            size = len(ids) * tensor[0].numel()
+            destination = buffer[offset:offset + size].view(shape)
+            torch.index_select(tensor, 0, gather, out=destination)
+            prepared.append(destination)
+            offset += size
+        return prepared, offset, time.perf_counter() - started
+
+    def build_subtree(descriptor, prepared, buffer, size, download_buffers):
+        nonlocal completed
+        ids, depth, node_start, parent, exact_start = descriptor
+        count = len(ids)
+        events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        stream = torch.cuda.current_stream(target)
+        events[0].record(stream)
+        uploaded = buffer[:size].to(target, non_blocking=True)
+        batch = []
+        offset = 0
+        for tensor in prepared:
+            batch.append(uploaded[offset:offset + tensor.numel()].view(tensor.shape))
+            offset += tensor.numel()
+        events[1].record(stream)
+        try:
+            subtree = _build_bvh_lod_cuda_flat(
+                *batch, max_depth - depth, min_points_per_node, opacity_mode,
+                retain_root_stats=True,
+            )
+        finally:
+            # A failed build must not return pinned storage while DMA reads it.
+            events[1].synchronize()
+        events[2].record(stream)
+        downloaded = {}
+        try:
+            for attr in _LOD_FLAT_ATTRS:
+                if attr == "_node_size":
+                    continue
+                tensor = getattr(subtree, attr)
+                staging = download_buffers[attr][:len(tensor)]
+                staging.copy_(tensor, non_blocking=True)
+                downloaded[attr] = staging
+        finally:
+            events[3].record(stream)
+            events[3].synchronize()
+        for name, first, last in (
+            ("batch_upload_gpu", 0, 1),
+            ("batch_build_gpu", 1, 2),
+            ("batch_download_gpu", 2, 3),
+        ):
+            subtree_timings[name] += events[first].elapsed_time(events[last]) / 1000
+        output_started = time.perf_counter()
+        for attr, values in downloaded.items():
+            if attr == "_node_parent":
+                values = torch.where(values >= 0, values + node_start, parent)
+            elif attr == "_node_leaf_start":
+                values = torch.where(
+                    downloaded["_node_is_leaf"], values + exact_start, 0
+                )
+            start = exact_start if attr.startswith("_flat_leaf_") else node_start
+            getattr(root, attr)[start:start + len(values)].copy_(values)
+        subtree_timings["batch_output_cpu"] += time.perf_counter() - output_started
+        stats = subtree._build_root_stats
+        del subtree, batch, uploaded, tensor
+        completed += count
+        if progress is not None:
+            progress(completed, n)
+        return stats
+
+    def partition(descriptor):
+        ids = descriptor[0]
+        count = len(ids)
+        lower = np.full(3, np.inf, dtype=np.float32)
+        upper = np.full(3, -np.inf, dtype=np.float32)
+        scan_points = min(max_points_per_batch, 1 << 20)
+        for start in range(0, count, scan_points):
+            points = xyz[ids[start:start + scan_points]]
+            lower = np.minimum(lower, points.min(axis=0))
+            upper = np.maximum(upper, points.max(axis=0))
+        axis = int(np.argmax(upper - lower))
+        extent = max(upper[axis] - lower[axis], np.finfo(np.float32).eps)
+        keys = np.empty(count, dtype=np.float32)
+        for start in range(0, count, scan_points):
+            end = min(start + scan_points, count)
+            keys[start:end] = (xyz[ids[start:end], axis] - lower[axis]) / extent
+        return lower, upper, keys
+
+    def merge(left, right, node_start, parent, lower, upper):
+        wa, mua, ca, cola, aa, ma = (t.to(target) for t in left)
+        wb, mub, cb, colb, ab, mb = (t.to(target) for t in right)
+        total = wa + wb
+        safe = total.clamp_min(1e-12)
+        zero = total <= 1e-12
+        mean = (wa[:, None] * mua + wb[:, None] * mub) / safe[:, None]
+        mean[zero] = 0.5 * (mua[zero] + mub[zero])
+        da, db = mua - mean, mub - mean
+        covariance = (
+            wa[:, None, None] * (ca + da[:, :, None] * da[:, None, :])
+            + wb[:, None, None] * (cb + db[:, :, None] * db[:, None, :])
+        ) / safe[:, None, None]
+        covariance[zero] = 0.5 * (ca[zero] + cb[zero])
+        weight_shape = (-1,) + (1,) * (colors.ndim - 1)
+        color = (
+            wa.reshape(weight_shape) * cola + wb.reshape(weight_shape) * colb
+        ) / safe.reshape(weight_shape)
+        color[zero] = 0.5 * (cola[zero] + colb[zero])
+        alpha = 1.0 - (1.0 - aa) * (1.0 - ab)
+        mass = ma + mb
+        eigenvalues, rotation = _eigh_symmetric_3x3(
+            0.5 * (covariance + covariance.transpose(-1, -2))
+        )
+        rotation[torch.linalg.det(rotation) < 0, :, -1] *= -1
+        proxy_scales = eigenvalues.clamp_min(1e-12).sqrt()
+        proxy_opacity = (
+            (mass / proxy_scales.prod(1).clamp_min(1e-12)).clamp(0, 1)
+            if opacity_mode == "mass" else alpha
+        )
+        root._node_center[node_start] = torch.from_numpy(0.5 * (lower + upper))
+        root._node_radius[node_start] = float(0.5 * np.linalg.norm(upper - lower))
+        root._node_is_leaf[node_start] = False
+        root._node_parent[node_start] = parent
+        for name, tensor in zip(
+            ("means", "quats", "scales", "opacities", "colors"),
+            (mean, _rotmat_to_quat(rotation), proxy_scales, proxy_opacity, color),
+        ):
+            getattr(root, f"_flat_proxy_{name}")[node_start].copy_(tensor[0].cpu())
+        return tuple(
+            t.cpu() for t in (total, mean, covariance, color, alpha, mass)
+        )
+
+    started = time.perf_counter()
+    active = [(indices, 0, 0, -1, 0)]
+    frontier = []
+    upper_nodes = []
+    gpu_sort_nodes = 0
+    sort_seconds = 0.0
+    with ThreadPoolExecutor(max_workers=cpu_workers) as executor:
+        while active:
+            splits = []
+            for descriptor in active:
+                if len(descriptor[0]) <= max_points_per_batch:
+                    frontier.append(descriptor)
+                else:
+                    splits.append(descriptor)
+            active = []
+            # Siblings own disjoint slices of indices. No torch operations or
+            # shared writes occur in workers, and results keep traversal order.
+            bounds = (
+                executor.map(partition, splits)
+                if cpu_workers > 1 else map(partition, splits)
+            )
+            for descriptor, (lower, upper, keys) in zip(splits, bounds):
+                ids, depth, node_start, parent, exact_start = descriptor
+                sort_started = time.perf_counter()
+                # Only keys/indices go to CUDA, not all Gaussian attributes.
+                # Large stable radix sorts need ~36 B/point on current torch;
+                # budget 40 B/point plus the shared free-VRAM safety margin.
+                if (
+                    auto_batch
+                    and len(ids) >= 1 << 18
+                    and len(ids) * 40 <= _bvh_build_vram_budget(target)
+                ):
+                    cuda_keys = torch.from_numpy(keys).to(target)
+                    order = torch.argsort(cuda_keys, stable=True).cpu().numpy()
+                    del cuda_keys
+                    gpu_sort_nodes += 1
+                else:
+                    order = np.argsort(keys, kind="stable")
+                ids[:] = ids[order]
+                del keys, order
+                sort_seconds += time.perf_counter() - sort_started
+                half = len(ids) // 2
+                left_start = node_start + 1
+                right_start = left_start + tree_size(half, depth + 1)
+                active.extend([
+                    (ids[:half], depth + 1, left_start, node_start, exact_start),
+                    (ids[half:], depth + 1, right_start, node_start, exact_start + half),
+                ])
+                upper_nodes.append(
+                    (node_start, parent, left_start, right_start, lower, upper)
+                )
+    partition_seconds = time.perf_counter() - started
+    if gpu_sort_nodes:
+        # Root-sized radix-sort blocks are not the subtree builder's sizes.
+        # Release this one-off workspace at the phase boundary, not per batch.
+        torch.cuda.empty_cache()
+    stats = {}
+    started = time.perf_counter()
+    frontier.sort(key=lambda desc: desc[-1])
+    max_batch = max(len(desc[0]) for desc in frontier)
+    input_width = sum(tensor[0].numel() for tensor in inputs)
+    input_buffers = [
+        torch.empty(
+            max_batch * input_width, dtype=torch.float32, device="cpu", pin_memory=True
+        )
+        for _ in range(min(2, len(frontier)))
+    ]
+    max_nodes = max(tree_size(len(desc[0]), desc[1]) for desc in frontier)
+    download_buffers = {}
+    for attr in _LOD_FLAT_ATTRS:
+        if attr == "_node_size":
+            continue
+        tensor = getattr(root, attr)
+        count = max_batch if attr.startswith("_flat_leaf_") else max_nodes
+        download_buffers[attr] = torch.empty(
+            (count,) + tensor.shape[1:], dtype=tensor.dtype,
+            device="cpu", pin_memory=True,
+        )
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="bvh-prefetch") as executor:
+        future = executor.submit(prepare_batch, frontier[0], input_buffers[0])
+        for index, descriptor in enumerate(frontier):
+            wait_started = time.perf_counter()
+            prepared, size, gather_seconds = future.result()
+            subtree_timings["batch_prefetch_wait"] += time.perf_counter() - wait_started
+            subtree_timings["batch_gather_cpu"] += gather_seconds
+            if index + 1 < len(frontier):
+                future = executor.submit(
+                    prepare_batch, frontier[index + 1],
+                    input_buffers[(index + 1) % len(input_buffers)],
+                )
+            buffer = input_buffers[index % len(input_buffers)]
+            stats[descriptor[2]] = build_subtree(
+                descriptor, prepared, buffer, size, download_buffers
+            )
+    del prepared, input_buffers, download_buffers, buffer, future
+    cuda_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    for node_start, parent, left, right, lower, upper in reversed(upper_nodes):
+        stats[node_start] = merge(
+            stats.pop(left), stats.pop(right), node_start, parent, lower, upper
+        )
+    root._build_timings = {
+        "upper_partition": partition_seconds,
+        "upper_sort_in_partition": sort_seconds,
+        "cuda_subtrees_and_copies": cuda_seconds,
+        **subtree_timings,
+        "upper_proxy_merge": time.perf_counter() - started,
+    }
+    root._build_gpu_sort_nodes = gpu_sort_nodes
     return root
 
 
