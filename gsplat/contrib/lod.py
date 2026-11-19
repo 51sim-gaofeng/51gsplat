@@ -48,6 +48,7 @@ Limitations (kept intentionally simple):
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -1942,6 +1943,7 @@ def save_lod_cache(root: OctreeNode, path: str) -> None:
     blob: Dict[str, object] = {
         "version": _LOD_CACHE_VERSION,
         "num_nodes": int(getattr(root, "_num_nodes", root._node_center.shape[0])),
+        "source_ply": getattr(root, "_source_ply", None),
     }
     for attr in _LOD_FLAT_ATTRS:
         blob[attr] = getattr(root, attr).detach().to("cpu").contiguous()
@@ -1950,17 +1952,29 @@ def save_lod_cache(root: OctreeNode, path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    torch.save(blob, tmp)
-    os.replace(tmp, path)  # atomic on the same filesystem
+    with tempfile.NamedTemporaryFile(
+        prefix=os.path.basename(path) + ".", suffix=".tmp",
+        dir=parent, delete=False,
+    ) as handle:
+        tmp = handle.name
+    try:
+        torch.save(blob, tmp)
+        os.replace(tmp, path)  # atomic on the same filesystem
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
-def load_lod_cache(path: str, device="cuda") -> "_CachedLODRoot":
+def load_lod_cache(
+    path: str, device="cuda", source_ply_md5: Optional[str] = None,
+) -> "_CachedLODRoot":
     """Reload a LOD cache written by :func:`save_lod_cache` onto ``device``.
 
     Returns a stand-in root accepted by :func:`select_lod`. Raises
     ``ValueError`` on a version mismatch and ``KeyError`` if the file is
     missing an expected tensor (either should trigger a rebuild by the caller).
+    When supplied, ``source_ply_md5`` must match the persisted source metadata;
+    this is checked before any cached tensors are uploaded to the device.
     """
     blob = torch.load(_windows_extended_path(path), map_location="cpu")
     version = blob.get("version") if isinstance(blob, dict) else None
@@ -1969,8 +1983,14 @@ def load_lod_cache(path: str, device="cuda") -> "_CachedLODRoot":
             f"LOD cache version mismatch: got {version!r}, "
             f"expected {_LOD_CACHE_VERSION}"
         )
+    source_ply = blob.get("source_ply")
+    if source_ply_md5 is not None and (
+        not isinstance(source_ply, dict) or source_ply.get("md5") != source_ply_md5
+    ):
+        raise ValueError("LOD cache source PLY MD5 mismatch or missing provenance")
     dev = torch.device(device)
     root = _CachedLODRoot()
+    root._source_ply = source_ply
     for attr in _LOD_FLAT_ATTRS:
         root.__dict__[attr] = blob[attr].to(dev)
     root._num_nodes = int(blob.get("num_nodes", root._node_center.shape[0]))
