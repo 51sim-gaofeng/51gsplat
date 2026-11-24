@@ -159,6 +159,7 @@ __all__ = [
 ]
 
 CUDA_FLAT_BVH_VERSION = 2
+LOD_BUILD_RESOURCE_VERSION = 3
 
 
 @dataclass
@@ -792,7 +793,7 @@ def _eigh_symmetric_3x3(covariances: Tensor) -> tuple[Tensor, Tensor]:
     return symeig3x3(covariances)
 
 
-def _build_bvh_lod_cuda_flat(
+def _build_bvh_lod_flat(
     means: Tensor,
     quats: Tensor,
     scales: Tensor,
@@ -803,7 +804,7 @@ def _build_bvh_lod_cuda_flat(
     opacity_mode: str,
     retain_root_stats: bool = False,
 ):
-    """Build the median-split hierarchy entirely as flat CUDA tensors."""
+    """Build the median-split hierarchy on the input tensors' device."""
     device = means.device
     n = means.shape[0]
     point_order = torch.arange(n, dtype=torch.long, device=device)
@@ -1135,13 +1136,84 @@ def _build_bvh_lod_cuda_flat(
     return root
 
 
-def _bvh_build_vram_budget(device) -> int:
-    free_bytes, _ = torch.cuda.mem_get_info(device)
+def _build_bvh_lod_cuda_flat(*args, **kwargs):
+    return _build_bvh_lod_flat(*args, **kwargs)
+
+
+def _build_bvh_lod_cpu_flat(*args, **kwargs):
+    return _build_bvh_lod_flat(*args, **kwargs)
+
+
+def _lod_cuda_sort_order(keys, device):
+    stream = torch.cuda.current_stream(device)
+    try:
+        cuda_keys = torch.from_numpy(keys).to(device)
+        return torch.argsort(cuda_keys, stable=True).cpu().numpy()
+    finally:
+        stream.synchronize()
+
+
+def _lod_host_memory() -> tuple[int, int]:
+    """Return available/total physical bytes without an optional dependency."""
+    if os.name == "nt":
+        import ctypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                *[(name, ctypes.c_ulonglong) for name in (
+                    "total", "available", "page_total", "page_available",
+                    "virtual_total", "virtual_available", "extended",
+                )],
+            ]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise ctypes.WinError()
+        return int(status.available), int(status.total)
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    return (
+        os.sysconf("SC_AVPHYS_PAGES") * page_size,
+        os.sysconf("SC_PHYS_PAGES") * page_size,
+    )
+
+
+def _lod_host_budget() -> int:
+    available, total = _lod_host_memory()
+    # Aim below 90%, leaving extra room for drivers and untracked allocations.
+    return available - int(total * 0.12) - 512 * 2**20
+
+
+def _require_lod_host_memory(required: int, phase: str) -> None:
+    budget = _lod_host_budget()
+    if required > budget:
+        raise MemoryError(
+            f"LOD {phase} needs {required / 2**30:.2f} GiB additional RAM, "
+            f"but only {max(0, budget) / 2**30:.2f} GiB is safe below 90% system usage. "
+            "Close other memory-heavy processes or build on a larger-memory host."
+        )
+
+
+def _bvh_build_vram_budget(device, gpu_memory_percent: float = 0.0) -> int:
+    if (
+        isinstance(gpu_memory_percent, bool)
+        or not isinstance(gpu_memory_percent, (int, float))
+        or not np.isfinite(gpu_memory_percent)
+        or not (gpu_memory_percent == 0 or 1 <= gpu_memory_percent <= 90)
+    ):
+        raise ValueError(
+            "LOD GPU memory percentage must be 0 (auto) or finite between 1 and 90"
+        )
+    gpu_memory_percent = gpu_memory_percent or 80.0
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     reusable = (
         torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     )
     available = free_bytes + reusable
-    return max(0, available - max(512 * 2**20, available // 5))
+    # Reserve one extra percentage point below the device-wide target.
+    reserve = int(total_bytes * ((101 - gpu_memory_percent) / 100))
+    return max(0, available - max(512 * 2**20, reserve, available // 5))
 
 
 @torch.no_grad()
@@ -1157,6 +1229,7 @@ def build_bvh_lod_batched(
     *,
     max_points_per_batch: int = 0,
     cpu_workers: int = 0,
+    gpu_memory_percent: float = 0.0,
     device: str = "cuda",
     progress: Optional[Callable[[int, int], None]] = None,
 ):
@@ -1167,6 +1240,14 @@ def build_bvh_lod_batched(
     copied into one preallocated CPU cache in preorder. No pages, streaming
     format, point sampling, or additional proxy quantization is introduced.
     Host storage remains O(N); GPU working storage is O(max_points_per_batch).
+    All batch limits are capped by current RAM/VRAM budgets and bounded pinned
+    staging. Insufficient resident host capacity raises before allocation.
+    gpu_memory_percent targets total device usage, including other processes,
+    with an extra percentage point reserved; it is not a hard allocator quota.
+    Values above the fixed 90 percent configuration ceiling are rejected.
+    A zero GPU percentage uses an automatic 80 percent safety target.
+    Lost headroom splits pending subtrees; CUDA OOM retries smaller subtrees
+    or bounded CPU work without discarding completed results.
     A zero batch limit chooses a conservative limit from available VRAM. A
     zero worker count uses up to eight CPU workers for independent upper splits.
     """
@@ -1188,26 +1269,37 @@ def build_bvh_lod_batched(
     target = torch.device(device)
     if target.type != "cuda":
         raise ValueError("batched BVH requires a CUDA build device")
+    requested_batch_points = max_points_per_batch
     auto_batch = max_points_per_batch == 0
-    if auto_batch:
-        budget = _bvh_build_vram_budget(target)
-        if budget <= 0:
-            raise RuntimeError("insufficient free VRAM for automatic BVH batching")
-        # Account for point scratch, appearance copies, and worst-case node
-        # density of a median tree; leave 20% (at least 512 MiB) uncommitted.
-        appearance_bytes = colors[0].numel() * colors.element_size()
-        node_ratio = min(2.0, 4.0 / min_points_per_node)
-        bytes_per_point = (
-            512 + 2 * appearance_bytes
-            + node_ratio * (256 + 3 * appearance_bytes)
-        )
-        max_points_per_batch = max(1, int(budget / bytes_per_point))
+    budget = _bvh_build_vram_budget(target, gpu_memory_percent)
+    effective_percent = gpu_memory_percent or 80.0
+    strategy = "auto" if gpu_memory_percent == 0 else "manual ceiling"
+    print(
+        f"[LOD] Build strategy={strategy}, GPU memory target={effective_percent:g}% "
+        f"(device-wide); working budget={budget / 2**30:.2f} GiB",
+        flush=True,
+    )
+    appearance_bytes = colors[0].numel() * colors.element_size()
+    node_ratio = min(2.0, 4.0 / min_points_per_node)
+    bytes_per_point = (
+        512 + 2 * appearance_bytes
+        + node_ratio * (256 + 3 * appearance_bytes)
+    )
+    safe_batch = max(1, int(budget / bytes_per_point)) if budget else 4096
+    max_points_per_batch = (
+        safe_batch if auto_batch else min(max_points_per_batch, safe_batch)
+    )
     cpu_workers = cpu_workers or min(8, os.cpu_count() or 1)
     largest_leaf = n
     for _ in range(max_depth):
         if largest_leaf <= min_points_per_node:
             break
         largest_leaf = (largest_leaf + 1) // 2
+    if (
+        max_points_per_batch < largest_leaf
+        and (auto_batch or requested_batch_points >= largest_leaf)
+    ):
+        max_points_per_batch = largest_leaf
     if largest_leaf > max_points_per_batch:
         raise ValueError(
             f"largest leaf ({largest_leaf} points) exceeds the batch limit "
@@ -1222,6 +1314,27 @@ def build_bvh_lod_batched(
         return 1 + tree_size(half, depth + 1) + tree_size(count - half, depth + 1)
 
     num_nodes = tree_size(n, 0)
+    input_width = sum(tensor[0].numel() for tensor in inputs)
+    # Float32 means, FP16 attributes, and flat topology (excluding its alias).
+    attribute_bytes = 12 + 2 * (input_width - 3)
+    output_bytes = (n + num_nodes) * attribute_bytes + num_nodes * 41
+    # Stable CPU sort: keys, int64 order/scratch, and indexed uint32 output.
+    partition_bytes = n * (28 if n < 2**32 else 40)
+    _require_lod_host_memory(output_bytes + partition_bytes, "BVH storage/sort")
+    staging_budget = min(
+        2 * 2**30, _lod_host_budget() - output_bytes - partition_bytes
+    )
+    staging_per_point = (
+        8 * input_width + attribute_bytes
+        + node_ratio * (attribute_bytes + 41) + 32
+    )
+    max_points_per_batch = min(
+        max_points_per_batch, max(0, int(staging_budget / staging_per_point))
+    )
+    if largest_leaf > max_points_per_batch:
+        raise MemoryError(
+            "LOD pinned staging cannot fit the largest leaf below 90% RAM usage"
+        )
     root = _CachedLODRoot()
     root._build_batch_points = max_points_per_batch
     root._build_cpu_workers = cpu_workers
@@ -1252,6 +1365,7 @@ def build_bvh_lod_batched(
         "batch_prefetch_wait": 0.0,
         "batch_upload_gpu": 0.0,
         "batch_build_gpu": 0.0,
+        "batch_build_cpu": 0.0,
         "batch_download_gpu": 0.0,
         "batch_output_cpu": 0.0,
     }
@@ -1272,31 +1386,25 @@ def build_bvh_lod_batched(
             offset += size
         return prepared, offset, time.perf_counter() - started
 
-    def build_subtree(descriptor, prepared, buffer, size, download_buffers):
-        nonlocal completed
+    def build_gpu_subtree(descriptor, prepared, buffer, size, download_buffers):
         ids, depth, node_start, parent, exact_start = descriptor
-        count = len(ids)
-        events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         stream = torch.cuda.current_stream(target)
-        events[0].record(stream)
-        uploaded = buffer[:size].to(target, non_blocking=True)
-        batch = []
-        offset = 0
-        for tensor in prepared:
-            batch.append(uploaded[offset:offset + tensor.numel()].view(tensor.shape))
-            offset += tensor.numel()
-        events[1].record(stream)
         try:
+            events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            events[0].record(stream)
+            uploaded = buffer[:size].to(target, non_blocking=True)
+            batch = []
+            offset = 0
+            for tensor in prepared:
+                batch.append(uploaded[offset:offset + tensor.numel()].view(tensor.shape))
+                offset += tensor.numel()
+            events[1].record(stream)
             subtree = _build_bvh_lod_cuda_flat(
                 *batch, max_depth - depth, min_points_per_node, opacity_mode,
                 retain_root_stats=True,
             )
-        finally:
-            # A failed build must not return pinned storage while DMA reads it.
-            events[1].synchronize()
-        events[2].record(stream)
-        downloaded = {}
-        try:
+            events[2].record(stream)
+            downloaded = {}
             for attr in _LOD_FLAT_ATTRS:
                 if attr == "_node_size":
                     continue
@@ -1304,15 +1412,21 @@ def build_bvh_lod_batched(
                 staging = download_buffers[attr][:len(tensor)]
                 staging.copy_(tensor, non_blocking=True)
                 downloaded[attr] = staging
-        finally:
             events[3].record(stream)
-            events[3].synchronize()
+        finally:
+            # Both upload and download DMA must finish before reusing buffers.
+            stream.synchronize()
         for name, first, last in (
             ("batch_upload_gpu", 0, 1),
             ("batch_build_gpu", 1, 2),
             ("batch_download_gpu", 2, 3),
         ):
             subtree_timings[name] += events[first].elapsed_time(events[last]) / 1000
+        return downloaded, subtree._build_root_stats
+
+    def commit_subtree(descriptor, downloaded, root_stats):
+        nonlocal completed
+        ids, depth, node_start, parent, exact_start = descriptor
         output_started = time.perf_counter()
         for attr, values in downloaded.items():
             if attr == "_node_parent":
@@ -1324,12 +1438,10 @@ def build_bvh_lod_batched(
             start = exact_start if attr.startswith("_flat_leaf_") else node_start
             getattr(root, attr)[start:start + len(values)].copy_(values)
         subtree_timings["batch_output_cpu"] += time.perf_counter() - output_started
-        stats = subtree._build_root_stats
-        del subtree, batch, uploaded, tensor
-        completed += count
+        stats[node_start] = root_stats
+        completed += len(ids)
         if progress is not None:
             progress(completed, n)
-        return stats
 
     def partition(descriptor):
         ids = descriptor[0]
@@ -1350,8 +1462,8 @@ def build_bvh_lod_batched(
         return lower, upper, keys
 
     def merge(left, right, node_start, parent, lower, upper):
-        wa, mua, ca, cola, aa, ma = (t.to(target) for t in left)
-        wb, mub, cb, colb, ab, mb = (t.to(target) for t in right)
+        wa, mua, ca, cola, aa, ma = left
+        wb, mub, cb, colb, ab, mb = right
         total = wa + wb
         safe = total.clamp_min(1e-12)
         zero = total <= 1e-12
@@ -1397,6 +1509,8 @@ def build_bvh_lod_batched(
     frontier = []
     upper_nodes = []
     gpu_sort_nodes = 0
+    gpu_sort_limit = n
+    recovery = {"cuda_ooms": 0, "budget_splits": 0, "cpu_subtrees": 0}
     sort_seconds = 0.0
     with ThreadPoolExecutor(max_workers=cpu_workers) as executor:
         while active:
@@ -1409,11 +1523,16 @@ def build_bvh_lod_batched(
             active = []
             # Siblings own disjoint slices of indices. No torch operations or
             # shared writes occur in workers, and results keep traversal order.
-            bounds = (
-                executor.map(partition, splits)
-                if cpu_workers > 1 else map(partition, splits)
-            )
-            for descriptor, (lower, upper, keys) in zip(splits, bounds):
+            # Do not let Executor.map retain a whole level of completed keys.
+            def bounded_partitions():
+                for start in range(0, len(splits), cpu_workers):
+                    window = splits[start:start + cpu_workers]
+                    _require_lod_host_memory(
+                        sum(len(desc[0]) for desc in window) * 28, "upper partition"
+                    )
+                    yield from executor.map(partition, window)
+
+            for descriptor, (lower, upper, keys) in zip(splits, bounded_partitions()):
                 ids, depth, node_start, parent, exact_start = descriptor
                 sort_started = time.perf_counter()
                 # Only keys/indices go to CUDA, not all Gaussian attributes.
@@ -1421,13 +1540,27 @@ def build_bvh_lod_batched(
                 # budget 40 B/point plus the shared free-VRAM safety margin.
                 if (
                     auto_batch
+                    and len(ids) <= gpu_sort_limit
                     and len(ids) >= 1 << 18
-                    and len(ids) * 40 <= _bvh_build_vram_budget(target)
+                    and len(ids) * 40 <= _bvh_build_vram_budget(target, gpu_memory_percent)
                 ):
-                    cuda_keys = torch.from_numpy(keys).to(target)
-                    order = torch.argsort(cuda_keys, stable=True).cpu().numpy()
-                    del cuda_keys
-                    gpu_sort_nodes += 1
+                    sort_oom = False
+                    try:
+                        order = _lod_cuda_sort_order(keys, target)
+                    except torch.cuda.OutOfMemoryError as exc:
+                        print(
+                            f"[LOD] CUDA OOM sorting {len(ids):,} points; "
+                            f"retrying this sort on CPU: {exc}", flush=True,
+                        )
+                        sort_oom = True
+                    if sort_oom:
+                        recovery["cuda_ooms"] += 1
+                        gpu_sort_limit = (len(ids) + 1) // 2
+                        with torch.cuda.device(target):
+                            torch.cuda.empty_cache()
+                        order = np.argsort(keys, kind="stable")
+                    else:
+                        gpu_sort_nodes += 1
                 else:
                     order = np.argsort(keys, kind="stable")
                 ids[:] = ids[order]
@@ -1447,15 +1580,19 @@ def build_bvh_lod_batched(
     if gpu_sort_nodes:
         # Root-sized radix-sort blocks are not the subtree builder's sizes.
         # Release this one-off workspace at the phase boundary, not per batch.
-        torch.cuda.empty_cache()
+        with torch.cuda.device(target):
+            torch.cuda.empty_cache()
     stats = {}
     started = time.perf_counter()
     frontier.sort(key=lambda desc: desc[-1])
     max_batch = max(len(desc[0]) for desc in frontier)
-    input_width = sum(tensor[0].numel() for tensor in inputs)
+    _require_lod_host_memory(
+        int(max_batch * staging_per_point), "pinned staging"
+    )
     input_buffers = [
         torch.empty(
-            max_batch * input_width, dtype=torch.float32, device="cpu", pin_memory=True
+            max_batch * input_width, dtype=torch.float32, device="cpu",
+            pin_memory=budget > 0,
         )
         for _ in range(min(2, len(frontier)))
     ]
@@ -1468,8 +1605,81 @@ def build_bvh_lod_batched(
         count = max_batch if attr.startswith("_flat_leaf_") else max_nodes
         download_buffers[attr] = torch.empty(
             (count,) + tensor.shape[1:], dtype=tensor.dtype,
-            device="cpu", pin_memory=True,
+            device="cpu", pin_memory=budget > 0,
         )
+    recovery_batch_points = max_points_per_batch
+
+    def process_subtree(descriptor, prepared, buffer, size):
+        nonlocal recovery_batch_points
+        ids, depth, node_start, parent, exact_start = descriptor
+        count = len(ids)
+        current_budget = _bvh_build_vram_budget(target, gpu_memory_percent)
+        safe_points = max(0, int(current_budget / bytes_per_point))
+        terminal = depth == max_depth or count <= min_points_per_node
+        fits = count <= min(recovery_batch_points, safe_points)
+        use_cpu = not fits and (terminal or (safe_points == 0 and count <= 4096))
+        oom = False
+        if fits:
+            _require_lod_host_memory(0, "subtree build")
+            try:
+                downloaded, root_stats = build_gpu_subtree(
+                    descriptor, prepared, buffer, size, download_buffers
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                print(
+                    f"[LOD] CUDA OOM building {count:,} points; "
+                    f"retrying with smaller subtrees: {exc}", flush=True,
+                )
+                oom = True
+            if not oom:
+                commit_subtree(descriptor, downloaded, root_stats)
+                return
+            # Leave the exception scope so its traceback releases CUDA tensors.
+            recovery["cuda_ooms"] += 1
+            with torch.cuda.device(target):
+                torch.cuda.empty_cache()
+            recovery_batch_points = min(recovery_batch_points, (count + 1) // 2)
+            use_cpu = terminal
+        if use_cpu:
+            _require_lod_host_memory(count * bytes_per_point, "CPU subtree fallback")
+            print(f"[LOD] Building {count:,}-point subtree on CPU", flush=True)
+            cpu_started = time.perf_counter()
+            subtree = _build_bvh_lod_cpu_flat(
+                *prepared, max_depth - depth, min_points_per_node, opacity_mode,
+                retain_root_stats=True,
+            )
+            downloaded = {
+                attr: getattr(subtree, attr) for attr in _LOD_FLAT_ATTRS
+                if attr != "_node_size"
+            }
+            commit_subtree(descriptor, downloaded, subtree._build_root_stats)
+            subtree_timings["batch_build_cpu"] += time.perf_counter() - cpu_started
+            recovery["cpu_subtrees"] += 1
+            return
+        recovery["budget_splits"] += 1
+        if not oom:
+            recovery_batch_points = min(recovery_batch_points, max(1, safe_points))
+        print(
+            f"[LOD] Splitting pending {count:,}-point subtree; "
+            f"current GPU batch ceiling={recovery_batch_points:,}", flush=True,
+        )
+        lower, upper, keys = partition(descriptor)
+        ids[:] = ids[np.argsort(keys, kind="stable")]
+        del keys
+        half = count // 2
+        left_start = node_start + 1
+        right_start = left_start + tree_size(half, depth + 1)
+        upper_nodes.append(
+            (node_start, parent, left_start, right_start, lower, upper)
+        )
+        for child in (
+            (ids[:half], depth + 1, left_start, node_start, exact_start),
+            (ids[half:], depth + 1, right_start, node_start, exact_start + half),
+        ):
+            child_prepared, child_size, seconds = prepare_batch(child, buffer)
+            subtree_timings["batch_gather_cpu"] += seconds
+            process_subtree(child, child_prepared, buffer, child_size)
+
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="bvh-prefetch") as executor:
         future = executor.submit(prepare_batch, frontier[0], input_buffers[0])
         for index, descriptor in enumerate(frontier):
@@ -1483,10 +1693,9 @@ def build_bvh_lod_batched(
                     input_buffers[(index + 1) % len(input_buffers)],
                 )
             buffer = input_buffers[index % len(input_buffers)]
-            stats[descriptor[2]] = build_subtree(
-                descriptor, prepared, buffer, size, download_buffers
-            )
-    del prepared, input_buffers, download_buffers, buffer, future
+            process_subtree(descriptor, prepared, buffer, size)
+    download_buffers.clear()
+    del prepared, input_buffers, buffer, future
     cuda_seconds = time.perf_counter() - started
     started = time.perf_counter()
     for node_start, parent, left, right, lower, upper in reversed(upper_nodes):
@@ -1501,6 +1710,8 @@ def build_bvh_lod_batched(
         "upper_proxy_merge": time.perf_counter() - started,
     }
     root._build_gpu_sort_nodes = gpu_sort_nodes
+    root._build_recovery = recovery
+    print(f"[LOD] Automatic recovery: {recovery}", flush=True)
     return root
 
 
