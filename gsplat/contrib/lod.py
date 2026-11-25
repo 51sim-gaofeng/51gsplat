@@ -1153,6 +1153,21 @@ def _lod_cuda_sort_order(keys, device):
         stream.synchronize()
 
 
+def _meminfo_available_bytes() -> int | None:
+    """Return MemAvailable, which counts reclaimable page cache unlike MemFree."""
+    try:
+        with open(_MEMINFO_PATH, encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+_MEMINFO_PATH = "/proc/meminfo"
+
+
 def _lod_host_memory() -> tuple[int, int]:
     """Return available/total physical bytes without an optional dependency."""
     if os.name == "nt":
@@ -1173,10 +1188,11 @@ def _lod_host_memory() -> tuple[int, int]:
             raise ctypes.WinError()
         return int(status.available), int(status.total)
     page_size = os.sysconf("SC_PAGE_SIZE")
-    return (
-        os.sysconf("SC_AVPHYS_PAGES") * page_size,
-        os.sysconf("SC_PHYS_PAGES") * page_size,
-    )
+    available = _meminfo_available_bytes()
+    if available is None:
+        # Kernels without MemAvailable: free pages only (conservative).
+        available = os.sysconf("SC_AVPHYS_PAGES") * page_size
+    return available, os.sysconf("SC_PHYS_PAGES") * page_size
 
 
 def _lod_host_budget() -> int:
